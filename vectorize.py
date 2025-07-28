@@ -1,15 +1,35 @@
 import os
+import sys
 import gzip
 import json
+import time
+import random
 import argparse
+import logging
+import contextlib
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
+from huggingface_hub import snapshot_download
 import psycopg2
 from psycopg2.extras import execute_values
 from urllib.parse import urlparse
-import sys
-import time
-import random
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+
+
+@contextlib.contextmanager
+def silence_everything():
+    with open(os.devnull, "w") as fnull:
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        sys.stdout = fnull
+        sys.stderr = fnull
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
 
 def get_connection(db_url):
     parsed_url = urlparse(db_url)
@@ -32,7 +52,7 @@ def estimate_total_lines(path):
         return None
     return count
 
-def ensure_vector_column(conn, table_name, output_column, vector_dim, dry_run, show_info=True):
+def ensure_vector_column(conn, model_path, table_name, output_column, dry_run, show_info=True):
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT a.attname, t.typname
@@ -52,6 +72,7 @@ def ensure_vector_column(conn, table_name, output_column, vector_dim, dry_run, s
                 print(f"[INFO] Column {output_column} already exists")
             return
 
+        vector_dim = SentenceTransformer(model_path).get_sentence_embedding_dimension()
         sql = f'ALTER TABLE "{table_name}" ADD COLUMN "{output_column}" VECTOR({vector_dim})'
         if dry_run:
             print(f"[DRY RUN] Would execute: {sql}")
@@ -71,21 +92,52 @@ def get_primary_key_column(conn, table_name):
             raise RuntimeError(f"No primary key found for table '{table_name}'")
         return pk_result[0]
 
-def get_null_vector_row_count(conn, table_name, output_column):
+def get_null_vector_row_count(conn, table_name, output_column, primary_key):
     with conn.cursor() as cur:
-        cur.execute(f'SELECT COUNT(*) FROM "{table_name}" WHERE "{output_column}" IS NULL')
+        cur.execute(f'SELECT COUNT("{primary_key}") FROM "{table_name}" WHERE "{output_column}" IS NULL')
         return cur.fetchone()[0]
 
-def vectorize_batch(db_url, table_name, input_column, output_column, primary_key, model, batch_size, dry_run, verbose, pbar=None, batch_index=0, warnings=None):
+def fetch_null_vector_ids(conn, table_name, output_column, primary_key, limit, verbose=False):
+    max_retries = 10
+    for attempt in range(1, max_retries + 1):
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f'SELECT "{primary_key}" FROM "{table_name}" WHERE "{output_column}" IS NULL LIMIT %s', (limit,))
+                return [row[0] for row in cur.fetchall()]
+        except Exception as e:
+            if attempt < max_retries:
+                print(f"[WARN] Retry {attempt}/{max_retries} on fetch_null_vector_ids: {e}", flush=True)
+                time.sleep(0.5 * attempt + random.uniform(0, 0.3))
+            else:
+                raise
+
+
+# Vectorizes a batch of rows by primary key.
+# - Establishes a new DB connection per batch.
+# - Encodes using SentenceTransformer in parallel.
+# - Retries on failure with exponential backoff.
+# - Reports status to tqdm or stdout depending on mode.
+
+def vectorize_batch(
+                    db_url, model_path, table_name,
+                    input_column, output_column, primary_key, ids,
+                    dry_run, verbose, pbar=None, batch_index=0, warnings=None
+                    ):
+    
+    if not ids:
+        return 0
+
     conn = get_connection(db_url)
     conn.autocommit = False
+
     with conn.cursor() as cur:
-        cur.execute(f'''
-            SELECT "{input_column}", "{primary_key}"
-            FROM "{table_name}"
-            WHERE "{output_column}" IS NULL
-            LIMIT %s
-        ''', (batch_size,))
+        placeholders = ','.join(['%s'] * len(ids))
+        cur.execute(
+            f'''
+                SELECT "{input_column}", "{primary_key}"
+                FROM "{table_name}"
+                WHERE "{primary_key}" IN ({placeholders})
+            ''', ids)
         batch = cur.fetchall()
 
     if not batch:
@@ -93,19 +145,21 @@ def vectorize_batch(db_url, table_name, input_column, output_column, primary_key
         return 0
 
     texts = [row_text for row_text, _ in batch]
-    ids = [row_id for _, row_id in batch]
+    row_ids = [row_id for _, row_id in batch]
+    model = SentenceTransformer(model_path)
     embeddings = model.encode(texts, show_progress_bar=False)
 
     if verbose:
-        for i, (row_id, row_text) in enumerate(zip(ids, texts), 1):
-            print(f"[INFO] (batch {batch_index}, {i}/{len(batch)}) Updating vector for row id {row_id}: '{row_text[:40]}'")
+        for i, (row_id, row_text) in enumerate(zip(row_ids, texts), 1):
+            input_column_text = row_text[:40].replace('\n', '').replace('\r', '')
+            print(f"[INFO] (batch {batch_index}, {i}/{len(batch)}) Updating vector for row id {row_id}: '{input_column_text}'")
 
     if not dry_run:
-        max_retries = 5
+        max_retries = 10
         for attempt in range(1, max_retries + 1):
             try:
                 with conn.cursor() as cur:
-                    values = [(row_id, embedding.tolist()) for row_id, embedding in zip(ids, embeddings)]
+                    values = [(row_id, embedding.tolist()) for row_id, embedding in zip(row_ids, embeddings)]
                     sql = f'''
                         UPDATE "{table_name}" AS t
                         SET "{output_column}" = v.embedding
@@ -143,56 +197,95 @@ def main():
     parser.add_argument("-o", "--output", required=True, help="Column to store the vector")
     parser.add_argument("-b", "--batch-size", type=int, default=1000, help="Rows to process per batch")
     parser.add_argument("-n", "--num-batches", type=int, default=None, help="Limit number of batches to process (default: all)")
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("-w", "--workers", type=int, default=multiprocessing.cpu_count(), help="Number of parallel workders to use (default: 1)")
+
+    # Disallow verbose and progress together
+    group = parser.add_argument_group()
+    group.add_argument("-v", "--verbose", action="store_true", help="Verbose output (used for debugging)")
     group.add_argument("-p", "--progress", action="store_true", help="Show progress bar")
+
     parser.add_argument("-d", "--dry-run", action="store_true", help="Print SQL statements without executing (only valid with --verbose)")
     args = parser.parse_args()
 
     if args.dry_run:
         if not args.verbose:
             parser.error("--dry-run must be used with --verbose")
-        if args.progress:
-            parser.error("--dry-run cannot be used with --progress")
 
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    vector_dim = model.get_sentence_embedding_dimension()
+    # Suppress huggingface_hub logger
+    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
-    conn = get_connection(args.url)
-    conn.autocommit = False
+    with silence_everything():
+        huggingface_path = snapshot_download("sentence-transformers/all-MiniLM-L6-v2")
 
-    primary_key = get_primary_key_column(conn, args.table)
-    ensure_vector_column(conn, args.table, args.output, vector_dim, args.dry_run, show_info=not args.progress)
-
-    if args.progress or args.verbose:
-        total_rows = get_null_vector_row_count(conn, args.table, args.output)
-        if args.verbose:
-            print(f"[INFO] Found {total_rows} rows with NULL vectors to process")
-
-    conn.close()
 
     total_batches = args.num_batches or float('inf')
     batch_counter = 0
+    conn = get_connection(args.url)
+    conn.autocommit = False
+    primary_key = get_primary_key_column(conn, args.table)
+    ensure_vector_column(conn, huggingface_path, args.table, args.output, args.dry_run, show_info=not args.progress)
 
+    total_rows = get_null_vector_row_count(conn, args.table, args.output, primary_key)
+
+    max_workers = os.cpu_count() or 4
+
+    pbar = None
     if args.progress:
-        with tqdm(total=total_rows if args.num_batches is None else min(total_rows, args.num_batches * args.batch_size), desc="Vectorizing", unit="rows", smoothing=0.01) as pbar:
-            while batch_counter < total_batches:
-                processed = vectorize_batch(args.url, args.table, args.input, args.output, primary_key, model, args.batch_size, args.dry_run, False, pbar=pbar, batch_index=batch_counter + 1, warnings=warnings)
-                if processed == 0:
-                    break
-                batch_counter += 1
-    else:
-        while batch_counter < total_batches:
-            processed = vectorize_batch(args.url, args.table, args.input, args.output, primary_key, model, args.batch_size, args.dry_run, args.verbose, batch_index=batch_counter + 1)
-            if processed == 0:
-                break
-            batch_counter += 1
+        pbar = tqdm(
+                    total=total_rows if args.num_batches is None else min(total_rows,
+                    args.num_batches * args.batch_size),
+                    desc="Vectorizing",
+                    unit="rows",
+                    smoothing=0.01
+                )
+
+    executor = ProcessPoolExecutor(max_workers=args.workers)
+    futures = []
+    warnings = []
+
+    all_ids = fetch_null_vector_ids(conn, args.table, args.output, primary_key, args.batch_size * int(total_batches))
+    # print("all_ids: ", json.dumps(all_ids, indent=2))
+
+    chunks = [all_ids[i:i + args.batch_size] for i in range(0, len(all_ids), args.batch_size)]
+    print("chunks: ", json.dumps(chunks, indent=2))
+
+    # for batch_index, id_chunk in enumerate(chunks): 
+    #     futures.append(executor.submit(
+    #         vectorize_batch,
+    #         args.url, huggingface_path, args.table,
+    #         args.input, args.output, primary_key, id_chunk,
+    #         args.dry_run, args.verbose, pbar, batch_index, warnings
+    #     ))
+    #     for future in as_completed(futures):
+    #         future.result()
+
+    start = None
+    if args.verbose:
+        start = time.time()
+
+    futures = [
+        executor.submit(
+            vectorize_batch,
+            args.url, huggingface_path, args.table,
+            args.input, args.output, primary_key, id_chunk,
+            args.dry_run, args.verbose, pbar, batch_index, warnings
+        ) for batch_index, id_chunk in enumerate(chunks)
+    ]
+
+    for future in as_completed(futures):
+        future.result()
+
+    if args.verbose:
+        print("Done in", time.time() - start, "seconds")
+
+
 
     if args.verbose:
         print("[INFO] Vectorization complete.")
+
     if args.progress and warnings:
         from datetime import datetime
-        print("[WARNINGS SUMMARY]", flush=True)
+        print("\n[WARNINGS SUMMARY]", flush=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_filename = f"warnings_{timestamp}.log"
         with open(log_filename, "w") as f:
@@ -200,6 +293,7 @@ def main():
                 print(w)
                 f.write(w + "\n")
         print(f"Total warnings: {len(warnings)}")
+
 
 if __name__ == "__main__":
     main()
