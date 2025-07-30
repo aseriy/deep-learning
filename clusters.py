@@ -2,8 +2,25 @@
 
 import argparse
 import psycopg2
+from urllib.parse import urlparse
 import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
+import os
+import time
+
+
+def get_connection(db_url):
+    parsed_url = urlparse(db_url)
+    return psycopg2.connect(
+        dbname=parsed_url.path[1:],
+        user=parsed_url.username,
+        password=parsed_url.password,
+        host=parsed_url.hostname,
+        port=parsed_url.port or 26257,
+        sslmode=parsed_url.query.split('sslmode=')[1] if parsed_url.query and 'sslmode=' in parsed_url.query else 'require'
+    )
+
 
 def get_primary_key(conn, table):
     with conn.cursor() as cur:
@@ -54,7 +71,10 @@ def fetch_unassigned_vector_ids(conn,
 
 
 
-def assign_clusters(conn, table, column, primary_key, latest_version, verbose, dry_run, batch_index, ids):
+def assign_clusters(db_url, table, column, primary_key, latest_version, verbose, dry_run, batch_index, ids):
+    conn = get_connection(db_url)
+    conn.autocommit = False
+
     centroid_table = f"{table}_{column}_centroid"
     cluster_table = f"{table}_{column}_clusters"
 
@@ -99,6 +119,8 @@ def assign_clusters(conn, table, column, primary_key, latest_version, verbose, d
         if verbose:
             print(f"[INFO] Assigned {rowcount} vectors")
 
+    conn.close()
+
     return rowcount
 
 
@@ -121,6 +143,8 @@ def main():
     cluster_table = f"{args.table}_{args.input}_clusters"
     latest_version = get_latest_centroid_version(conn, centroid_table)
 
+    max_workers = os.cpu_count() or 4
+
     total_limit = None
     if args.num_batches:
         total_limit = args.batch_size * args.num_batches
@@ -138,16 +162,35 @@ def main():
     if args.verbose:
         print(f"[INFO] Prefetched {len(all_ids)} IDs and split into {len(chunks)} chunks")
 
-    for batch_index, id_chunk in enumerate(chunks):
-        print (batch_index, json.dumps(id_chunk, indent=2))
-        rowcount = assign_clusters(
-            conn,
+    conn.close()
+
+
+    executor = ProcessPoolExecutor(max_workers=args.workers)
+    futures = []
+    warnings = []
+
+
+    start = None
+    if args.verbose:
+        start = time.time()
+
+    futures = [
+        executor.submit(
+            assign_clusters,
+            args.url,
             args.table, args.input, primary_key, latest_version,
             args.verbose, args.dry_run, batch_index, id_chunk
-        )
+        ) for batch_index, id_chunk in enumerate(chunks)
+    ]
+
+    for future in as_completed(futures):
+        future.result()
+
+    if args.verbose:
+        print("Done in", time.time() - start, "seconds")
 
 
-    conn.close()
+
 
 
 if __name__ == "__main__":
