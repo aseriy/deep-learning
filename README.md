@@ -45,11 +45,30 @@ This is a **proof-of-concept implementation**, not yet production-ready. The goa
 ### Pipeline Steps
 
 1. **Ingest** – `json-to-sql.py`
-   Reads `.gz` files containing newline-delimited JSON records and generates **batched SQL ****`INSERT`**** statements**.
+   Reads `.gz` files containing newline-delimited JSON records and generates **batched SQL `INSERT` statements**.
 
    * Automatically infers columns from the first record
    * Supports `ON CONFLICT DO NOTHING` for safe re-ingestion
    * Accepts CLI flags for batch size (`--batch-size`), verbosity, and output location
+
+   Example usage:
+
+   ````bash
+   python json-to-sql.py \
+     data/msmarco_passage_00.gz \
+     -t passage \
+     -k pid \
+     -b 1000 \
+     -o ./sql \
+     --progress
+   ```\
+   Reads `.gz` files containing newline-delimited JSON records and generates **batched SQL ****`INSERT`**** statements**.
+
+   - Automatically infers columns from the first record
+   - Supports `ON CONFLICT DO NOTHING` for safe re-ingestion
+   - Accepts CLI flags for batch size (`--batch-size`), verbosity, and output location
+
+   ````
 
 2. **Import** – Cockroach SQL shell
    Load the `.sql` files produced in Step 1 into CockroachDB using the built-in SQL client. For example:
@@ -77,6 +96,29 @@ This is a **proof-of-concept implementation**, not yet production-ready. The goa
    * Embeddings are written back into the table using `UPDATE ... FROM (VALUES ...)`
    * Allows full control over the output column name via the `--output` CLI flag
    * Automatically creates the vector column if it doesn’t exist (based on the model’s embedding dimension)
+
+   Example usage:
+
+   ````bash
+   python vectorize.py \
+     -u postgresql://user:pass@localhost:26257/mydb \
+     -t passage \
+     -i passage \
+     -o passage_vector \
+     -b 1000 \
+     -w 4 \
+     --progress
+   ```\
+   Generates vector embeddings for rows in a target table using the [SentenceTransformers](https://www.sbert.net/) library. Operates in parallel across batches of rows with missing vectors.
+
+   - Connects to CockroachDB and identifies rows where the target vector column is `NULL`
+   - Downloads a Hugging Face model snapshot and uses it to encode input text
+   - Uses multiprocessing to process batches in parallel via `ProcessPoolExecutor`
+   - Embeddings are written back into the table using `UPDATE ... FROM (VALUES ...)`
+   - Allows full control over the output column name via the `--output` CLI flag
+   - Automatically creates the vector column if it doesn’t exist (based on the model’s embedding dimension)
+
+   ````
 
 4. **Compute Centroids** – `centroid.py`
    Clusters vectorized rows using KMeans (or optionally DBSCAN) and saves the resulting centroids to the database.
