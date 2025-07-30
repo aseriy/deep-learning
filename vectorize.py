@@ -249,16 +249,6 @@ def main():
     chunks = [all_ids[i:i + args.batch_size] for i in range(0, len(all_ids), args.batch_size)]
     print("chunks: ", json.dumps(chunks, indent=2))
 
-    # for batch_index, id_chunk in enumerate(chunks): 
-    #     futures.append(executor.submit(
-    #         vectorize_batch,
-    #         args.url, huggingface_path, args.table,
-    #         args.input, args.output, primary_key, id_chunk,
-    #         args.dry_run, args.verbose, pbar, batch_index, warnings
-    #     ))
-    #     for future in as_completed(futures):
-    #         future.result()
-
     start = None
     if args.verbose:
         start = time.time()
