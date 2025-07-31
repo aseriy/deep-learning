@@ -125,7 +125,7 @@ This is a **proof-of-concept implementation**, not yet production-ready. The goa
 
    * Fetches all non-null vectors from the specified table and column
    * Uses `MiniBatchKMeans` for efficient clustering with partial fitting
-   * Supports loading and updating from an existing centroid version (`--increment`)
+   * Supports **incremental updates** to centroids by loading the latest version and refining it (`--increment`)
    * Assigns and saves a versioned cluster ID using an auto-incrementing sequence
 
    **Note:** The `<table>_<input>_centroid` table and associated sequence must be created in advance.
