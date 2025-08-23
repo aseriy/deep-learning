@@ -17,6 +17,16 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 
 
+_MODEL_CACHE = {}
+
+def get_model(model_path: str) -> SentenceTransformer:
+    m = _MODEL_CACHE.get(model_path)
+    if m is None:
+        m = SentenceTransformer(model_path)   # loads once per process
+        _MODEL_CACHE[model_path] = m
+    return m
+
+
 @contextlib.contextmanager
 def silence_everything():
     with open(os.devnull, "w") as fnull:
@@ -146,7 +156,7 @@ def vectorize_batch(
 
     texts = [row_text for row_text, _ in batch]
     row_ids = [row_id for _, row_id in batch]
-    model = SentenceTransformer(model_path)
+    model = get_model(model_path)
     embeddings = model.encode(texts, show_progress_bar=False)
 
     if verbose:
