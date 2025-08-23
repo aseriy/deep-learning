@@ -120,7 +120,7 @@ This is a **proof-of-concept implementation**, not yet production-ready. The goa
 
    ````
 
-4. **Compute Centroids** – `centroid.py`
+4. **Compute Centroids** – `centroids.py`
    Clusters vectorized rows using KMeans (or optionally DBSCAN) and saves the resulting centroids to the database.
 
    * Fetches all non-null vectors from the specified table and column
@@ -159,7 +159,7 @@ This is a **proof-of-concept implementation**, not yet production-ready. The goa
    Example usage:
 
    ````bash
-   python centroid.py \
+   python centroids.py \
      -u postgresql://user:pass@localhost:26257/mydb \
      -t passage_table \
      -i passage_vector \
