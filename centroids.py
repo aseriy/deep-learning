@@ -57,7 +57,6 @@ def fetch_vectors(conn,
         FROM {table} AS s
         LEFT JOIN {clusters_table} AS c
           ON c.pid = s.{pk}
-         AND c.epoch = %s
         WHERE s.{column} IS NOT NULL
           AND c.pid IS NULL
         ORDER BY s.{pk} ASC
@@ -65,7 +64,7 @@ def fetch_vectors(conn,
     """
   
     if verbose:
-        print(sql % (latest_epoch,))
+        print(sql)
 
     with conn.cursor() as cur:
         cur.execute(sql, (latest_epoch,))
@@ -96,40 +95,117 @@ def fetch_vectors(conn,
 
 
 def save_centroids(conn, table, column, centroids, increment, verbose, dry_run):
-    cur = conn.cursor()
-    cur.execute(f"SELECT nextval('%s_%s_centroid_seq')" % (table, column))
-    cluster_version = cur.fetchone()[0]
+    """
+    Save centroids into {table}_{column}_centroid with epoch policy:
+      - First ever save → epoch = 0
+      - Every subsequent save → epoch = nextval({table}_{column}_centroid_seq)
 
+    Note: `increment` only affects whether caller used prior centroids as init.
+          We *always* create a new epoch when we save (centroids shifted).
+    """
+    centroids_table = f"{table}_{column}_centroid"
+    seq_name = f"{table}_{column}_centroid_seq"
+
+    # Allocate a fresh epoch from the sequence (first call yields whatever you set via RESTART WITH)
+    target_epoch = 0
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT nextval('{seq_name}')")
+        (target_epoch,) = cur.fetchone()
+
+  
     if verbose:
-        print("\n[RESULT] Cluster centroids:")
-    
-    for i, centroid in enumerate(centroids):
-        version_to_use = cluster_version if not increment else f"(SELECT MAX(version) FROM {table}_{column}_centroid)"
+        print(f"[INFO] Saving {len(centroids)} centroids into epoch {target_epoch}")
 
-        sql = f"UPSERT INTO {table}_{column}_centroid (version, id, centroid) VALUES ({version_to_use}, %s, %s)"
+    sql = f"UPSERT INTO {centroids_table} (epoch, id, centroid) VALUES (%s, %s, %s)"
 
-        if verbose:
-            print(sql % (i, centroid.tolist()))
+    with conn.cursor() as cur:
+        for i, c in enumerate(centroids):
+            vec = c.tolist() if isinstance(c, np.ndarray) else (c if isinstance(c, list) else list(c))
+            if verbose:
+                print(sql % (target_epoch, i, vec))
+            if not dry_run:
+                cur.execute(sql, (target_epoch, i, vec))
 
-        if dry_run:
-            print(f"[INFO] Upserting centroid {i} to version {version_to_use}: {centroid.tolist()}")
+    if not dry_run:
+        conn.commit()
 
-        cur.execute(sql, (i, centroid.tolist()))
+    return target_epoch
 
-    conn.commit()
-    cur.close()
+
+
+def save_cluster_assignments(
+        conn,
+        table, column,
+        epoch, pks, labels,
+        verbose=False, dry_run=False):
+    """
+    Save row→centroid assignments into {table}_{column}_clusters for a given epoch.
+    Expects:
+      - epoch: int   (the epoch you just used for centroids)
+      - pks:   list  (primary-key values aligned with `labels`)
+      - labels: array-like of ints (cluster ids aligned with `pks`)
+    """
+    clusters_table = f"{table}_{column}_clusters"
+
+    sql = f"UPSERT INTO {clusters_table} (pid, epoch, cluster_id) VALUES (%s, %s, %s)"
+
+    with conn.cursor() as cur:
+        for pk, label in zip(pks, labels):
+            cluster_id = int(label)
+            if verbose:
+                print(sql % (pk, epoch, cluster_id))
+            if not dry_run:
+                cur.execute(sql, (pk, epoch, cluster_id))
+
+    if not dry_run:
+        conn.commit()
+
 
 
 def load_existing_centroids(conn, table, column, verbose=False):
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT MAX(version) FROM {table}_{column}_centroid")
-        latest_version = cur.fetchone()[0]
-        cur.execute(f"SELECT centroid FROM {table}_{column}_centroid WHERE version = %s ORDER BY id", (latest_version,))
-        rows = cur.fetchall()
+    """
+    Load centroids for the latest epoch from {table}_{column}_centroid.
+    Returns: np.ndarray[float32, K×D] or None if none exist.
+    """
+    centroids_table = f"{table}_{column}_centroid"
+    result = None
+
+    # 1) Get latest epoch
+    latest_epoch = get_current_epoch(conn, centroids_table, verbose=verbose)
+
     if verbose:
-        for i, row in enumerate(rows):
-            print(f"[INFO] Loaded centroid {i}: {row[0]}")
-    return np.array([ast.literal_eval(r[0]) if isinstance(r[0], str) else r[0] for r in rows], dtype=np.float32)
+        print(f"[INFO] Latest centroid epoch: {latest_epoch}")
+
+    if latest_epoch:
+        # 2) Fetch centroids for that epoch
+        sql_rows = f"SELECT id, centroid FROM {centroids_table} WHERE epoch = %s ORDER BY id"
+        if verbose:
+            print(sql_rows % (latest_epoch,))
+
+        with conn.cursor() as cur:
+            cur.execute(sql_rows, (latest_epoch,))
+            rows = cur.fetchall()
+
+        # 3) Normalize to 2-D float32 array
+        centroids = []
+        for _cid, c in rows:
+            if isinstance(c, list):
+                vec = c
+            elif isinstance(c, np.ndarray):
+                vec = c.tolist()
+            elif isinstance(c, str):
+                vec = json.loads(c)
+                if not isinstance(vec, list):
+                    raise ValueError("parsed centroid JSON is not a list")
+            else:
+                vec = list(c)  # fallback for VECTOR adapter
+            centroids.append(vec)
+
+        arr = np.array(centroids, dtype=np.float32)
+        if arr.size > 0:
+            result = arr  # else stays None
+
+    return result
 
 
 def cluster_kmeans(vectors, num_clusters, num_batches=None, initial_centroids=None, batch_size=1000):
@@ -178,6 +254,11 @@ def main():
     parser.add_argument("--increment", action="store_true", help="Update latest centroid version incrementally instead of creating a new one")
     args = parser.parse_args()
 
+    # MiniBatchKMeans requires the **first** partial_fit batch to have >= n_clusters
+    if args.batch_size < args.clusters:
+        parser.error(f"--batch-size ({args.batch_size}) must be >= --clusters ({args.clusters}).")
+
+  
     conn = psycopg2.connect(args.url)
     pks, vectors = fetch_vectors(
         conn,
@@ -190,16 +271,23 @@ def main():
     )
 
     if args.verbose:
-      print(json.dumps(pks, indent=2))
-      print(vectors)
-
-    exit(0)
+      print(f"[INFO] PKs: {json.dumps(pks, indent=2)}")
+      print(f"[INFO] Vectors: {vectors}")
+  
   
     if args.progress:
         vectors = tqdm(vectors, desc="Clustering", unit="vec")  # Just visual aid, does not affect clustering
 
     if args.algorithm == "kmeans":
-        initial_centroids = load_existing_centroids(conn, args.table, args.input, verbose=args.verbose) if args.increment else None
+        initial_centroids = load_existing_centroids(
+              conn,
+              args.table, args.input,
+              verbose=args.verbose
+        ) if args.increment else None
+
+        if args.verbose:
+          print(f"[INFO] Initial centroids: {initial_centroids}")
+      
         labels, model = cluster_kmeans(
                   np.array(vectors), args.clusters, args.num_batches,
                   initial_centroids,
@@ -209,8 +297,24 @@ def main():
     else:
         labels, centroids = cluster_dbscan(np.array(vectors))
 
+    if args.verbose:
+      print(f"[INFO] Labels: {labels}")
+      print(f"[INFO] Model: {model}")
+      print(f"[INFO] Centroids: {centroids}")
+      
+
     if centroids is not None:
-        save_centroids(conn, args.table, args.input, centroids, args.increment, args.verbose, args.dry_run)
+        current_epoch = save_centroids(
+                conn, args.table, args.input,
+                centroids, args.increment,
+                args.verbose, args.dry_run
+        )
+        save_cluster_assignments(
+            conn, args.table, args.input,
+            epoch = current_epoch,       # same epoch used in save_centroids
+            pks=pks, labels=labels,
+            verbose=args.verbose, dry_run=args.dry_run,
+        )
     else:
         print("DBSCAN does not generate explicit centroids.")
 
