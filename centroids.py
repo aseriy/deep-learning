@@ -40,6 +40,10 @@ def save_centroids(conn, table, column, centroids, increment, verbose, dry_run):
     cur = conn.cursor()
     cur.execute(f"SELECT nextval('%s_%s_centroid_seq')" % (table, column))
     cluster_version = cur.fetchone()[0]
+
+    if verbose:
+        print("\n[RESULT] Cluster centroids:")
+    
     for i, centroid in enumerate(centroids):
         version_to_use = cluster_version if not increment else f"(SELECT MAX(version) FROM {table}_{column}_centroid)"
 
@@ -125,8 +129,6 @@ def main():
     else:
         labels, centroids = cluster_dbscan(np.array(vectors))
 
-    print("\n[RESULT] Cluster centroids:")
-    
     if centroids is not None:
         save_centroids(conn, args.table, args.input, centroids, args.increment, args.verbose, args.dry_run)
     
