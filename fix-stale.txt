@@ -1,0 +1,54 @@
+Yes—your “staleness fixer” should:
+
+Work off the latest epoch, not per-centroid.
+
+For each stale row, recompute the nearest centroid among the current epoch’s centroids, then write a fresh mapping for the current epoch.
+
+Here’s a concise, set-based way to do it in CRDB (no canvas changes):
+
+-- 1) Find the current epoch
+WITH cur AS (
+  SELECT max(epoch) AS epoch FROM public.passage_passage_vector_centroid
+),
+
+-- 2) Pick a batch of stale rows (any pid whose latest mapping predates current epoch)
+stale AS (
+  SELECT c.pid
+  FROM public.passage_passage_vector_clusters AS c, cur
+  WHERE c.epoch < cur.epoch
+  GROUP BY c.pid
+  LIMIT 1000  -- tune batch size
+),
+
+-- 3) Fetch their vectors
+vecs AS (
+  SELECT s.pid, s.passage_vector
+  FROM public.passage AS s
+  JOIN stale USING (pid)
+),
+
+-- 4) For each vector, choose the nearest centroid from the current epoch
+assign AS (
+  SELECT
+    v.pid,
+    (SELECT ce.id
+     FROM public.passage_passage_vector_centroid AS ce, cur
+     WHERE ce.epoch = cur.epoch
+     ORDER BY ce.centroid <-> v.passage_vector ASC
+     LIMIT 1) AS cluster_id
+  FROM vecs AS v
+)
+
+-- 5) Upsert the new mapping for the current epoch
+UPSERT INTO public.passage_passage_vector_clusters (pid, epoch, cluster_id)
+SELECT a.pid, cur.epoch, a.cluster_id
+FROM assign AS a, cur;
+
+
+Notes:
+
+This re-associates stale rows to the closest centroid of the current epoch (not necessarily the same centroid as before).
+
+Because your PK is (pid, epoch), the UPSERT will insert or overwrite the row for the current epoch, leaving historical epochs intact.
+
+Run this periodically or after every N centroid updates; adjust the LIMIT for batching.
