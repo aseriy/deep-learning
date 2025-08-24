@@ -228,7 +228,6 @@ def main():
         huggingface_path = snapshot_download("sentence-transformers/all-MiniLM-L6-v2")
 
 
-    total_batches = args.num_batches or float('inf')
     batch_counter = 0
     conn = get_connection(args.url)
     conn.autocommit = False
@@ -253,11 +252,17 @@ def main():
     futures = []
     warnings = []
 
-    all_ids = fetch_null_vector_ids(conn, args.table, args.output, primary_key, args.batch_size * int(total_batches))
+    # Determine how many IDs to fetch overall
+    if args.num_batches is None:
+        total_limit = total_rows
+    else:
+        total_limit = args.batch_size * args.num_batches
+
+    all_ids = fetch_null_vector_ids(conn, args.table, args.output, primary_key, total_limit)
     # print("all_ids: ", json.dumps(all_ids, indent=2))
 
     chunks = [all_ids[i:i + args.batch_size] for i in range(0, len(all_ids), args.batch_size)]
-    print("chunks: ", json.dumps(chunks, indent=2))
+    # print("chunks: ", json.dumps(chunks, indent=2))
 
     start = None
     if args.verbose:

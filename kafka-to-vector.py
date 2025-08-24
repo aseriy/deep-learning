@@ -246,7 +246,10 @@ def main():
     parser.add_argument("-T", "--table", required=True, help="Target table name (e.g., passages)")
     parser.add_argument("-k", "--kafka-url", required=True)
     parser.add_argument("-t", "--kafka-topic", required=True)
-    parser.add_argument("-g", "--kafka-consumer-group", required=True)
+    parser.add_argument("-g", "--kafka-consumer-group-prefix", required=True,
+                        help="Prefix for Kafka consumer group; script appends _insert or _update")
+    parser.add_argument("-m", "--message-type", choices=["insert", "update"], required=True,
+                        help="Which CDC messages to process (insert or update)")
     parser.add_argument("-b", "--batch-size", type=int, default=100)
     parser.add_argument("-n", "--num-batches", type=int, default=None)
     parser.add_argument("--batch-interval-ms", type=int, default=0)
@@ -263,13 +266,16 @@ def main():
     with silence_everything():
         huggingface_path = snapshot_download("sentence-transformers/all-MiniLM-L6-v2")
 
-    if not validate_kafka(args.kafka_url, args.kafka_topic, args.kafka_consumer_group):
+    # Resolve concrete consumer group from prefix + message type
+    consumer_group = f"{args.kafka_consumer_group_prefix}_{args.message_type}"
+
+    if not validate_kafka(args.kafka_url, args.kafka_topic, consumer_group):
         sys.exit(-1)
 
     total_processed = 0
     batch_num = 0
 
-    consumer = build_consumer(args.kafka_url, args.kafka_topic, args.kafka_consumer_group, args.batch_size)
+    consumer = build_consumer(args.kafka_url, args.kafka_topic, consumer_group, args.batch_size)
     idle_ms = 250
     idle_cap_ms = 10_000
 
@@ -288,7 +294,7 @@ def main():
                     pass
                 time.sleep(idle_ms / 1000.0)
                 idle_ms = min(idle_ms * 2, idle_cap_ms)
-                consumer = build_consumer(args.kafka_url, args.kafka_topic, args.kafka_consumer_group, args.batch_size)
+                consumer = build_consumer(args.kafka_url, args.kafka_topic, consumer_group, args.batch_size)
                 continue
 
             batch: List[Dict[str, Any]] = []
