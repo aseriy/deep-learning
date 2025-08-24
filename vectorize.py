@@ -206,7 +206,14 @@ def main():
     parser.add_argument("-i", "--input", required=True, help="Column containing input text")
     parser.add_argument("-o", "--output", required=True, help="Column to store the vector")
     parser.add_argument("-b", "--batch-size", type=int, default=1000, help="Rows to process per batch")
-    parser.add_argument("-n", "--num-batches", type=int, default=None, help="Limit number of batches to process (default: all)")
+    parser.add_argument("-n", "--num-batches", type=int, default=1,
+                        help="Number of batches to process before exiting (default: 1)")
+    parser.add_argument("-F", "--follow", action="store_true",
+                        help="Keep running: keep vectorizing new NULL rows indefinitely")
+    parser.add_argument("--max-idle", type=float, default=60.0,
+                        help="Max idle time before exit, in MINUTES (0 = no idle limit)")
+    parser.add_argument("--min-idle", type=float, default=15.0,
+                        help="Initial idle backoff between empty scans, in SECONDS")
     parser.add_argument("-w", "--workers", type=int, default=multiprocessing.cpu_count(), help="Number of parallel workders to use (default: 1)")
 
     # Disallow verbose and progress together
@@ -230,7 +237,8 @@ def main():
 
     batch_counter = 0
     conn = get_connection(args.url)
-    conn.autocommit = False
+    conn.autocommit = True
+
     primary_key = get_primary_key_column(conn, args.table)
     ensure_vector_column(conn, huggingface_path, args.table, args.output, args.dry_run, show_info=not args.progress)
 
@@ -252,33 +260,63 @@ def main():
     futures = []
     warnings = []
 
-    # Determine how many IDs to fetch overall
-    if args.num_batches is None:
-        total_limit = total_rows
-    else:
-        total_limit = args.batch_size * args.num_batches
+    # Backoff state
+    idle_wait = max(0.001, float(args.min_idle))   # seconds
+    idle_spent = 0.0                               # seconds
+    idle_budget = max(0.0, float(args.max_idle) * 60.0)  # seconds (0 = unlimited)
 
-    all_ids = fetch_null_vector_ids(conn, args.table, args.output, primary_key, total_limit)
-    # print("all_ids: ", json.dumps(all_ids, indent=2))
+    start = time.time() if args.verbose else None
 
-    chunks = [all_ids[i:i + args.batch_size] for i in range(0, len(all_ids), args.batch_size)]
-    # print("chunks: ", json.dumps(chunks, indent=2))
+    # Per-run counters (1-based for human-friendly logs)
+    run_counter = 1
+    batch_in_run = 1
 
-    start = None
-    if args.verbose:
-        start = time.time()
+    while True:
+        # Stop after N batches per run (default 1) unless following
+        if (not args.follow) and batch_in_run > args.num_batches:
+            break
 
-    futures = [
-        executor.submit(
-            vectorize_batch,
-            args.url, huggingface_path, args.table,
-            args.input, args.output, primary_key, id_chunk,
-            args.dry_run, args.verbose, pbar, batch_index, warnings
-        ) for batch_index, id_chunk in enumerate(chunks)
-    ]
+        # Fetch one page of IDs (no wait on start or after successful work)
+        ids = fetch_null_vector_ids(conn, args.table, args.output, primary_key, args.batch_size)
 
-    for future in as_completed(futures):
-        future.result()
+        if ids:
+            # Got work → reset backoff
+            idle_wait = max(0.001, float(args.min_idle))
+            idle_spent = 0.0
+
+            # Run one batch (via pool for per-process model reuse)
+            if args.verbose:
+                print(f"[INFO] Run {run_counter}, Batch {batch_in_run} starting ({len(ids)} rows)")
+            fut = executor.submit(
+                vectorize_batch,
+                args.url, huggingface_path, args.table,
+                args.input, args.output, primary_key, ids,
+                args.dry_run, args.verbose, pbar, batch_in_run, warnings
+            )
+            fut.result()
+            batch_counter += 1
+            batch_in_run += 1
+            if args.follow and batch_in_run > args.num_batches:
+                if args.verbose:
+                    print(f"[INFO] Run {run_counter} complete ({args.num_batches} batches).")
+                run_counter += 1
+                batch_in_run = 1
+            continue
+
+        # No work returned → back off or exit if max idle reached
+        if idle_budget > 0.0 and idle_spent >= idle_budget:
+            if args.verbose:
+                print(f"[INFO] Max idle reached ({args.max_idle} min). Exiting.")
+            break
+
+        # Sleep current backoff and then double it (exponential), cap by remaining budget if any
+        to_sleep = idle_wait
+        if idle_budget > 0.0:
+            remaining = max(0.0, idle_budget - idle_spent)
+            to_sleep = min(to_sleep, remaining)
+        time.sleep(to_sleep)
+        idle_spent += to_sleep
+        idle_wait = idle_wait * 2.0
 
     if args.verbose:
         print("Done in", time.time() - start, "seconds")
