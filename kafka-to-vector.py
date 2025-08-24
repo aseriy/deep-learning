@@ -107,6 +107,19 @@ def commit_processed_messages(kafka_url: str, kafka_topic: str, consumer_group: 
         consumer.close()
 
 
+def build_consumer(kafka_url: str, topic: str, group: str, batch_size: int) -> KafkaConsumer:
+    return KafkaConsumer(
+        topic,
+        bootstrap_servers=kafka_url,
+        group_id=group,
+        enable_auto_commit=False,
+        auto_offset_reset="earliest",
+        max_poll_records=batch_size,
+        # Consider raising if vectorization can take a long time per batch
+        # max_poll_interval_ms=900000,  # 15 minutes
+    )
+
+
 def vectorize_from_kafka_batch(
     messages: List[Dict[str, Any]],
     *,
@@ -256,46 +269,91 @@ def main():
     total_processed = 0
     batch_num = 0
 
-    while True:
-        if args.num_batches is not None and batch_num >= args.num_batches:
-            break
+    consumer = build_consumer(args.kafka_url, args.kafka_topic, args.kafka_consumer_group, args.batch_size)
+    idle_ms = 250
+    idle_cap_ms = 10_000
 
-        batch = fetch_kafka_batch(args.kafka_url, args.kafka_topic, args.kafka_consumer_group, args.batch_size)
-        if args.verbose:
-            print(f"[batch {batch_num+1}] fetched messages: {json.dumps(batch, indent=2, default=str)}")
+    try:
+        while True:
+            if args.num_batches is not None and batch_num >= args.num_batches:
+                break
 
-        if not batch:
-            print(f"[batch {batch_num+1}] No more messages to process.")
-            break
+            try:
+                polled = consumer.poll(timeout_ms=1000)
+            except Exception as e:
+                print(f"[poll] error: {e} — rebuilding consumer", flush=True)
+                try:
+                    consumer.close()
+                except Exception:
+                    pass
+                time.sleep(idle_ms / 1000.0)
+                idle_ms = min(idle_ms * 2, idle_cap_ms)
+                consumer = build_consumer(args.kafka_url, args.kafka_topic, args.kafka_consumer_group, args.batch_size)
+                continue
 
-        processed_count, processed_offsets = vectorize_from_kafka_batch(
-            messages=batch,
-            db_url=args.url,
-            table=args.table,
-            input_column=args.input,
-            output_column=args.output,
-            primary_key=args.primary_key,
-            model_path=huggingface_path,
-            dry_run=args.dry_run,
-            verbose=args.verbose,
-            batch_index=batch_num + 1,
-        )
-        print(f"[batch {batch_num+1}] processed rows: {processed_count}")
-        print(f"[batch {batch_num+1}] processed offsets: {len(processed_offsets)}")
+            batch: List[Dict[str, Any]] = []
+            for tp, records in (polled or {}).items():
+                for r in records:
+                    batch.append({
+                        "topic": r.topic,
+                        "partition": r.partition,
+                        "offset": r.offset,
+                        "timestamp": r.timestamp,
+                        "key": r.key,
+                        "value": r.value,
+                        "headers": dict(r.headers) if r.headers else {},
+                    })
+                    if len(batch) >= args.batch_size:
+                        break
+                if len(batch) >= args.batch_size:
+                    break
 
-        committed_partitions = commit_processed_messages(
-            kafka_url=args.kafka_url,
-            kafka_topic=args.kafka_topic,
-            consumer_group=args.kafka_consumer_group,
-            processed_messages=processed_offsets,
-        )
-        print(f"[batch {batch_num+1}] committed offsets for {committed_partitions} partitions (messages: {len(processed_offsets)})")
+            if not batch:
+                print(f"[batch {batch_num+1}] No more messages to process. Exiting.")
+                break
 
-        total_processed += processed_count
-        batch_num += 1
+            idle_ms = 250
 
-        if args.batch_interval_ms > 0 and (args.num_batches is None or batch_num < args.num_batches):
-            time.sleep(args.batch_interval_ms / 1000.0)
+            if args.verbose:
+                print(f"[batch {batch_num+1}] fetched: {len(batch)} records")
+
+            processed_count, processed_offsets = vectorize_from_kafka_batch(
+                messages=batch,
+                db_url=args.url,
+                table=args.table,
+                input_column=args.input,
+                output_column=args.output,
+                primary_key=args.primary_key,
+                model_path=huggingface_path,
+                dry_run=args.dry_run,
+                verbose=args.verbose,
+                batch_index=batch_num + 1,
+            )
+            print(f"[batch {batch_num+1}] processed rows: {processed_count}")
+            print(f"[batch {batch_num+1}] processed offsets: {len(processed_offsets)}")
+
+            highest: Dict[int, int] = {}
+            for p, o in processed_offsets:
+                prev = highest.get(p)
+                if prev is None or o > prev:
+                    highest[p] = o
+
+            if highest:
+                commit_map = {TopicPartition(args.kafka_topic, p): OffsetAndMetadata(o + 1, None, -1)
+                              for p, o in highest.items()}
+                try:
+                    consumer.commit(offsets=commit_map)
+                    print(f"[batch {batch_num+1}] committed offsets for {len(commit_map)} partitions (messages: {len(processed_offsets)})")
+                except Exception as e:
+                    print(f"[commit] error: {e} — will retry on next loop", flush=True)
+
+            total_processed += processed_count
+            batch_num += 1
+    finally:
+        try:
+            consumer.close()
+        except Exception:
+            pass
 
     print(f"Total messages indexed: {total_processed}")
 

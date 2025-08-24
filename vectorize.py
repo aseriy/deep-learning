@@ -157,7 +157,7 @@ def vectorize_batch(
     texts = [row_text for row_text, _ in batch]
     row_ids = [row_id for _, row_id in batch]
     model = get_model(model_path)
-    embeddings = model.encode(texts, show_progress_bar=False)
+    embeddings = model.encode(texts, batch_size=128, show_progress_bar=False)
 
     if verbose:
         for i, (row_id, row_text) in enumerate(zip(row_ids, texts), 1):
