@@ -2,7 +2,8 @@ import os, sys, argparse, json
 import array
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, MetaData, Table, select, func, cast, String, Column, Integer
+from sqlalchemy.sql.sqltypes import NullType
 from sklearn.decomposition import PCA
 
 from dash import Dash, html, dcc, Output, Input, State, no_update
@@ -13,16 +14,38 @@ def parse_cli():
     # Parse CLI args
     p = argparse.ArgumentParser()
     p.add_argument("-u", "--url", required=True, help="CockroachDB connection URL")
-    p.add_argument("-t", "--table", default="public.passage_passage_vector_centroid", help="Table with centroids")
-    p.add_argument("--id", dest="id_col", default="id", help="Centroid ID column")
-    p.add_argument("-i", "--input", dest="vec_col", default="centroid", help="Vector column")
+    p.add_argument("-t", "--table", required=True, help="Table with centroids")
     p.add_argument("--poll", type=int, default=10, help="Poll seconds")
     p.add_argument("--dims", type=int, choices=[2,3], default=2, help="Output dims")
-    p.add_argument("--port", type=int, default=None, help="HTTP port (fallback to $PORT or 8080)")
+    p.add_argument("--port", type=int, default=None, help="HTTP port (fallback to $PORT or 9000)")
     return p.parse_args()
 
 ARGS = parse_cli()
 ENGINE = create_engine(ARGS.url, pool_pre_ping=True)
+
+# ---------- SQLAlchemy Core table definition (no reflection) ----------
+
+def _split_schema_table(qualified: str):
+    # Accept "schema.table" or just "table"
+    if "." in qualified and not qualified.startswith('"'):
+        schema, name = qualified.split(".", 1)
+        return schema, name
+    return None, qualified
+
+_SCHEMA, _TABLE_NAME = _split_schema_table(ARGS.table)
+_MD = MetaData()
+_T = Table(
+    _TABLE_NAME,
+    _MD,
+    Column("id", Integer, primary_key=True),
+    Column("centroid", NullType()),  # CockroachDB VECTOR; parsed manually
+    Column("epoch", Integer, primary_key=True),
+    schema=_SCHEMA,
+)
+
+_ID_COL = _T.c.id
+_VEC_COL = _T.c.centroid
+_EPOCH_COL = _T.c.epoch
 
 # ---------- helpers ----------
 def parse_vec(x):
@@ -52,10 +75,22 @@ def parse_vec(x):
         return np.array([], dtype=float)
 
 def _fetch_rows(cast_to_string: bool):
-    vec_expr = f"CAST({ARGS.vec_col} AS STRING)" if cast_to_string else ARGS.vec_col
-    sql = f"SELECT {ARGS.id_col} AS cid, {vec_expr} AS vec FROM {ARGS.table} ORDER BY cid"
+    # Build a SQLAlchemy Core statement that selects latest epoch only
+    vec_expr = cast(_VEC_COL, String) if cast_to_string else _VEC_COL
+    latest_epoch = select(func.max(_EPOCH_COL)).scalar_subquery()
+
+    stmt = (
+        select(
+            _ID_COL.label("cid"),
+            vec_expr.label("vec"),
+        )
+        .where(_EPOCH_COL == latest_epoch)
+        .order_by(_ID_COL)
+    )
+
     with ENGINE.connect() as conn:
-        return conn.execute(text(sql)).fetchall()
+        return conn.execute(stmt).fetchall()
+
 
 def load_centroids():
     # Try without cast first
@@ -86,12 +121,11 @@ def load_centroids():
     dropped = int((lens != dim).sum())
 
     df = df[lens == dim].sort_values("cid").reset_index(drop=True)
-    X = np.vstack(df["vec"].to_list())
-
-    # Attach some metadata for status
-    df.attrs["dropped"] = dropped
-    df.attrs["dim"] = dim
-    return df[["cid"]], X
+    X = np.vstack(df["vec"].to_list())    # Build 'meta' and attach attrs after column selection so they persist
+    meta = df[["cid"]].copy()
+    meta.attrs["dropped"] = dropped
+    meta.attrs["dim"] = dim
+    return meta, X
 
 def pca_fit(X, n_out):
     p = PCA(n_components=n_out, random_state=42).fit(X)
@@ -129,6 +163,7 @@ app.layout = html.Div([
     # Stores
     dcc.Store(id="pca_basis"),         # holds components/mean
     dcc.Store(id="last_basis_dims"),   # tracks dims used for basis
+    dcc.Store(id="last_reset_clicks", data=0),   # last seen Reset n_clicks
 
     # Polling
     dcc.Interval(id="poll", interval=ARGS.poll*1000, n_intervals=0),
@@ -138,23 +173,29 @@ app.layout = html.Div([
     Output("graph","figure"),
     Output("pca_basis","data"),
     Output("last_basis_dims","data"),
+    Output("last_reset_clicks","data"),
     Output("status","children"),
     Input("poll","n_intervals"),
     Input("reset","n_clicks"),
     State("dims","value"),
     State("pca_basis","data"),
     State("last_basis_dims","data"),
+    State("last_reset_clicks","data"),
     prevent_initial_call=False,
 )
-def refresh(_n, reset_clicks, n_out, basis, last_dims):
+def refresh(_n, reset_clicks, n_out, basis, last_dims, last_reset):
     # Load latest centroids
     meta, X = load_centroids()
     if X is None or meta.empty:
         fig = px.scatter(x=[], y=[])
-        return fig, basis, last_dims, "No data"
+        return fig, basis, last_dims, last_reset, "No data"
 
     # Ensure basis exists & matches dims, or reset requested
-    need_fit = basis is None or (last_dims != n_out) or (reset_clicks and reset_clicks > 0)
+    # Detect a *new* reset click and decide if we need to refit
+    reset_clicks = reset_clicks or 0
+    last_reset = last_reset or 0
+    clicked_now = reset_clicks > last_reset
+    need_fit = (basis is None) or (last_dims != n_out) or clicked_now
     if need_fit:
         basis = pca_fit(X, n_out)
         last_dims = n_out
@@ -179,7 +220,8 @@ def refresh(_n, reset_clicks, n_out, basis, last_dims):
     dropped = getattr(meta, "attrs", {}).get("dropped", 0)
     dim = getattr(meta, "attrs", {}).get("dim", X.shape[1])
     status = f"Centroids: {len(meta)} • Dim: {dim} • Dims out: {n_out}" + (f" • Dropped: {dropped}" if dropped else "")
-    return fig, basis, last_dims, status
+    new_last_reset = reset_clicks if clicked_now else last_reset
+    return fig, basis, last_dims, new_last_reset, status
 
 if __name__ == "__main__":
     # Dev mode (useful for quick testing). For production, run via gunicorn below.
