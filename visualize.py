@@ -151,8 +151,11 @@ app.layout = html.Div([
     html.Div([
         html.Label("Dims"),
         dcc.Dropdown(
-            id="dims", options=[{"label":"2D","value":2},{"label":"3D","value":3}],
-            value=ARGS.dims, clearable=False, style={"width":"120px"}
+            id="dims",
+            options=[{"label":"2D","value":2},{"label":"3D","value":3}],
+            value=2,  # force 2D on initial load
+            clearable=False,
+            style={"width":"120px"}
         ),
         html.Button("Reset PCA basis", id="reset", n_clicks=0, style={"marginLeft":"12px"}),
         html.Span(id="status", style={"marginLeft":"12px", "opacity":0.7}),
@@ -177,7 +180,7 @@ app.layout = html.Div([
     Output("status","children"),
     Input("poll","n_intervals"),
     Input("reset","n_clicks"),
-    State("dims","value"),
+    Input("dims","value"),          # <-- moved here (was State)
     State("pca_basis","data"),
     State("last_basis_dims","data"),
     State("last_reset_clicks","data"),

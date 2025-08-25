@@ -52,3 +52,137 @@ This re-associates stale rows to the closest centroid of the current epoch (not 
 Because your PK is (pid, epoch), the UPSERT will insert or overwrite the row for the current epoch, leaving historical epochs intact.
 
 Run this periodically or after every N centroid updates; adjust the LIMIT for batching.
+
+
+
+-- Inputs (substitute your names)
+--   base table:        {table}                with columns: {pk}, {column} (vector)
+--   centroids table:   {table}_{column}_centroid   (epoch, id, centroid)
+--   clusters table:    {table}_{column}_clusters   (pid, epoch, cluster_id)
+
+WITH latest AS (
+  SELECT max(epoch) AS e FROM {table}_{column}_centroid
+)
+UPSERT INTO {table}_{column}_clusters (pid, epoch, cluster_id)
+SELECT s.{pk} AS pid,
+       l.e     AS epoch,
+       c.id    AS cluster_id
+FROM {table} AS s
+CROSS JOIN latest AS l
+JOIN LATERAL (
+  SELECT id
+  FROM {table}_{column}_centroid
+  WHERE epoch = l.e
+  ORDER BY l2_distance(s.{column}, centroid)  -- or cosine_distance / inner_product
+  LIMIT 1
+) AS c ON true;
+
+
+
+
+-- Inputs (substitute your names)
+--   base table:        {table}                with columns: {pk}, {column} (vector)
+--   centroids table:   {table}_{column}_centroid   (epoch, id, centroid)
+--   clusters table:    {table}_{column}_clusters   (pid, epoch, cluster_id)
+
+WITH latest AS (
+  SELECT max(epoch) AS e FROM passage_passage_vector_centroid
+)
+UPSERT INTO passage_passage_vector_clusters (pid, epoch, cluster_id)
+SELECT s.pid AS pid,
+       l.e     AS epoch,
+       c.id    AS cluster_id
+FROM passage AS s
+CROSS JOIN latest AS l
+JOIN LATERAL (
+  SELECT id
+  FROM passage_passage_vector_centroid
+  WHERE epoch = l.e
+  ORDER BY l2_distance(s.passage_vector, centroid)  -- or cosine_distance / inner_product
+  LIMIT 1
+) AS c ON true;
+
+
+
+
+WITH stale AS (
+  SELECT pid
+  FROM passage_passage_vector_clusters
+  WHERE epoch = 2
+  ORDER BY pid
+  LIMIT 1000            -- batch size; adjust as needed
+),
+latest AS (
+  SELECT max(epoch) AS e
+  FROM passage_passage_vector_centroid
+)
+UPSERT INTO passage_passage_vector_clusters (pid, epoch, cluster_id)
+SELECT s.pid,
+       l.e,
+       c.id
+FROM stale AS s
+JOIN passage AS p
+  ON p.pid = s.pid
+CROSS JOIN latest AS l
+JOIN LATERAL (
+  SELECT id
+  FROM passage_passage_vector_centroid
+  WHERE epoch = l.e
+  ORDER BY l2_distance(p.passage_vector, centroid)
+  LIMIT 1
+) AS c ON true;
+
+
+CLEANUP AFTERWARDS
+
+DELETE
+FROM passage_passage_vector_centroid
+WHERE epoch = 2;
+
+DELETE
+FROM passage_passage_vector_centroid AS c
+WHERE epoch = 2
+  AND NOT EXISTS (
+    SELECT 1
+    FROM passage_passage_vector_clusters AS cl
+    WHERE cl.epoch = c.epoch
+  );
+
+
+
+Update with cleanup as a transaction
+
+BEGIN;
+
+-- remap a batch of 10000 rows from epoch X
+WITH stale AS (
+  SELECT pid
+  FROM passage_passage_vector_clusters
+  WHERE epoch = $EPOCH
+  ORDER BY pid
+  LIMIT 10000
+)
+, latest AS (
+  SELECT max(epoch) AS e
+  FROM passage_passage_vector_centroid
+)
+UPSERT INTO passage_passage_vector_clusters (pid, epoch, cluster_id)
+SELECT s.pid, l.e, c.id
+FROM stale AS s
+JOIN passage AS p
+  ON p.pid = s.pid
+CROSS JOIN latest AS l
+JOIN LATERAL (
+  SELECT id
+  FROM passage_passage_vector_centroid
+  WHERE epoch = l.e
+  ORDER BY l2_distance(p.passage_vector, centroid)
+  LIMIT 1
+) AS c ON true;
+
+-- then clear just those PIDs out of the stale epoch
+DELETE FROM passage_passage_vector_clusters
+WHERE epoch = $EPOCH
+  AND pid IN (SELECT pid FROM stale);
+
+COMMIT;
