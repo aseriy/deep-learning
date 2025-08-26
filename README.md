@@ -195,7 +195,7 @@ This is a **proof-of-concept implementation**, not yet production-ready. The goa
 
    Example usage:
 
-   ````bash
+   ```bash
    python clusters.py \
      -u postgresql://user:pass@localhost:26257/mydb \
      -t passage \
@@ -203,11 +203,10 @@ This is a **proof-of-concept implementation**, not yet production-ready. The goa
      -b 5000 \
      --workers 4 \
      --progress
-   ```\
+   ```
    Batches over vectorized rows not yet assigned to a cluster.
 
    - Uses CockroachDB’s vector similarity functions to find and assign the nearest centroid.
-   ````
 
 Each step is modular, designed to allow experimentation and future enhancements such as parallelization, smarter cluster initialization, or dynamic re-clustering.
 

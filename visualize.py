@@ -42,6 +42,21 @@ _T = Table(
     Column("epoch", Integer, primary_key=True),
     schema=_SCHEMA,
 )
+# Derive the clusters table name from the centroid table ("*_centroid" -> "*_clusters")
+_CLUSTERS_TNAME = (
+    _TABLE_NAME.replace("_centroid", "_clusters")
+    if _TABLE_NAME.endswith("_centroid")
+    else "passage_passage_vector_clusters"
+)
+
+_TC = Table(
+    _CLUSTERS_TNAME,
+    _MD,
+    Column("pid", String, primary_key=True),
+    Column("epoch", Integer, primary_key=True),
+    Column("cluster_id", Integer),
+    schema=_SCHEMA,
+)
 
 _ID_COL = _T.c.id
 _VEC_COL = _T.c.centroid
@@ -74,6 +89,22 @@ def parse_vec(x):
     except Exception:
         return np.array([], dtype=float)
 
+def _fetch_cluster_counts():
+    latest_epoch = select(func.max(_EPOCH_COL)).scalar_subquery()
+    stmt = (
+        select(
+            _TC.c.cluster_id.label("cid"),
+            func.count().label("n_members"),
+        )
+        .where(_TC.c.epoch == latest_epoch)
+        .group_by(_TC.c.cluster_id)
+        .order_by(_TC.c.cluster_id)
+    )
+    with ENGINE.connect() as conn:
+        rows = conn.execute(stmt).fetchall()
+    # dict like {cid: n_members, ...}
+    return {int(cid): int(n) for cid, n in rows}
+
 def _fetch_rows(cast_to_string: bool):
     # Build a SQLAlchemy Core statement that selects latest epoch only
     vec_expr = cast(_VEC_COL, String) if cast_to_string else _VEC_COL
@@ -90,6 +121,27 @@ def _fetch_rows(cast_to_string: bool):
 
     with ENGINE.connect() as conn:
         return conn.execute(stmt).fetchall()
+
+
+def radii_from_counts_2d(meta_df, counts_by_cid, max_frac=0.10):
+    """
+    Compute a 2D circle radius per centroid so that circle AREA ~ member count.
+    The largest circle's radius is max_frac of the plot's dominant span.
+    """
+    import numpy as np
+
+    cids = meta_df["cid"].astype(int).to_numpy()
+    counts = np.array([counts_by_cid.get(int(cid), 0) for cid in cids], dtype=float)
+    if counts.size == 0 or counts.max() <= 0:
+        return np.zeros_like(counts)
+
+    # Area proportionality => radius ∝ sqrt(count)
+    # Normalize by max count so the biggest circle has radius = max_frac * plot span
+    span_x = float(meta_df["x"].max() - meta_df["x"].min())
+    span_y = float(meta_df["y"].max() - meta_df["y"].min())
+    span = max(span_x, span_y) or 1.0
+    r_max = max_frac * span
+    return r_max * np.sqrt(counts / counts.max())
 
 
 def load_centroids():
@@ -208,16 +260,49 @@ def refresh(_n, reset_clicks, n_out, basis, last_dims, last_reset):
 
     # Build figure
     meta = meta.copy()
+    # Cluster sizes for latest epoch (used for circle/marker sizing)
+    counts = _fetch_cluster_counts()
     if n_out == 2:
         meta["x"], meta["y"] = Y[:,0], Y[:,1]
         fig = px.scatter(meta, x="x", y="y", text=meta["cid"].astype(str),
                          title="Centroids (fixed PCA basis)")
         fig.update_traces(marker=dict(size=16, symbol="x"), textposition="top center")
+
+        # Circles sized by cluster member counts (area ∝ count)
+        radii = radii_from_counts_2d(meta, counts, max_frac=0.10)
+        for (x, y, r) in zip(meta["x"], meta["y"], radii):
+            if r <= 0:
+                continue
+            fig.add_shape(
+                type="circle",
+                xref="x", yref="y",
+                x0=x - r, x1=x + r,
+                y0=y - r, y1=y + r,
+                line=dict(width=1, color="rgba(0,0,0,0.25)"),
+                layer="below",
+            )
+        # Keep units equal so circles render as true circles
+        fig.update_yaxes(scaleanchor="x", scaleratio=1)
+
+        # Ensure the plot range includes the circles (not just the points)
+        if len(radii) and float(np.max(radii)) > 0:
+            rmax = float(np.max(radii))
+            x_min, x_max = float(meta["x"].min()) - rmax, float(meta["x"].max()) + rmax
+            y_min, y_max = float(meta["y"].min()) - rmax, float(meta["y"].max()) + rmax
+            fig.update_xaxes(range=[x_min, x_max])
+            fig.update_yaxes(range=[y_min, y_max])
     else:
         meta["x"], meta["y"], meta["z"] = Y[:,0], Y[:,1], Y[:,2]
         fig = px.scatter_3d(meta, x="x", y="y", z="z", text=meta["cid"].astype(str),
                             title="Centroids (fixed PCA basis)")
-        fig.update_traces(marker=dict(size=6, symbol="x"))
+
+        # Scale marker sizes by √count (proxy for circle area)
+        s_counts = np.array([counts.get(int(cid), 0) for cid in meta["cid"]], dtype=float)
+        if s_counts.max() > 0:
+            sizes = 6.0 + 24.0 * (np.sqrt(s_counts) / np.sqrt(s_counts.max()))
+            fig.update_traces(marker=dict(size=sizes, symbol="x"))
+        else:
+            fig.update_traces(marker=dict(size=6, symbol="x"))
 
     fig.update_layout(showlegend=False)
     dropped = getattr(meta, "attrs", {}).get("dropped", 0)
