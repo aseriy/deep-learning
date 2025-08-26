@@ -208,9 +208,7 @@ app.layout = html.Div([
             value=2,  # force 2D on initial load
             clearable=False,
             style={"width":"120px"}
-        ),
-        html.Button("Reset PCA basis", id="reset", n_clicks=0, style={"marginLeft":"12px"}),
-        html.Span(id="status", style={"marginLeft":"12px", "opacity":0.7}),
+        ),        html.Span(id="status", style={"marginLeft":"12px", "opacity":0.7}),
     ], style={"display":"flex","alignItems":"center","gap":"8px","marginBottom":"8px"}),
 
     dcc.Graph(id="graph", style={"height":"70vh"}),
@@ -218,8 +216,6 @@ app.layout = html.Div([
     # Stores
     dcc.Store(id="pca_basis"),         # holds components/mean
     dcc.Store(id="last_basis_dims"),   # tracks dims used for basis
-    dcc.Store(id="last_reset_clicks", data=0),   # last seen Reset n_clicks
-
     # Polling
     dcc.Interval(id="poll", interval=ARGS.poll*1000, n_intervals=0),
 ])
@@ -228,32 +224,23 @@ app.layout = html.Div([
     Output("graph","figure"),
     Output("pca_basis","data"),
     Output("last_basis_dims","data"),
-    Output("last_reset_clicks","data"),
-    Output("status","children"),
+        Output("status","children"),
     Input("poll","n_intervals"),
-    Input("reset","n_clicks"),
-    Input("dims","value"),          # <-- moved here (was State)
+        Input("dims","value"),          # <-- moved here (was State)
     State("pca_basis","data"),
     State("last_basis_dims","data"),
-    State("last_reset_clicks","data"),
-    prevent_initial_call=False,
+        prevent_initial_call=False,
 )
-def refresh(_n, reset_clicks, n_out, basis, last_dims, last_reset):
+def refresh(_n, n_out, basis, last_dims):
     # Load latest centroids
     meta, X = load_centroids()
     if X is None or meta.empty:
         fig = px.scatter(x=[], y=[])
-        return fig, basis, last_dims, last_reset, "No data"
+        return fig, basis, last_dims, "No data"
 
-    # Ensure basis exists & matches dims, or reset requested
-    # Detect a *new* reset click and decide if we need to refit
-    reset_clicks = reset_clicks or 0
-    last_reset = last_reset or 0
-    clicked_now = reset_clicks > last_reset
-    need_fit = (basis is None) or (last_dims != n_out) or clicked_now
-    if need_fit:
-        basis = pca_fit(X, n_out)
-        last_dims = n_out
+    # Refit PCA on every refresh so axes follow the latest data
+    basis = pca_fit(X, n_out)
+    last_dims = n_out
 
     # Transform with (cached) basis
     Y = pca_transform(X, basis)
@@ -265,7 +252,7 @@ def refresh(_n, reset_clicks, n_out, basis, last_dims, last_reset):
     if n_out == 2:
         meta["x"], meta["y"] = Y[:,0], Y[:,1]
         fig = px.scatter(meta, x="x", y="y", text=meta["cid"].astype(str),
-                         title="Centroids (fixed PCA basis)")
+                         title="Centroids (PCA refit each refresh)")
         fig.update_traces(marker=dict(size=16, symbol="x"), textposition="top center")
 
         # Circles sized by cluster member counts (area ∝ count)
@@ -294,7 +281,7 @@ def refresh(_n, reset_clicks, n_out, basis, last_dims, last_reset):
     else:
         meta["x"], meta["y"], meta["z"] = Y[:,0], Y[:,1], Y[:,2]
         fig = px.scatter_3d(meta, x="x", y="y", z="z", text=meta["cid"].astype(str),
-                            title="Centroids (fixed PCA basis)")
+                            title="Centroids (PCA refit each refresh)")
 
         # Scale marker sizes by √count (proxy for circle area)
         s_counts = np.array([counts.get(int(cid), 0) for cid in meta["cid"]], dtype=float)
@@ -308,8 +295,7 @@ def refresh(_n, reset_clicks, n_out, basis, last_dims, last_reset):
     dropped = getattr(meta, "attrs", {}).get("dropped", 0)
     dim = getattr(meta, "attrs", {}).get("dim", X.shape[1])
     status = f"Centroids: {len(meta)} • Dim: {dim} • Dims out: {n_out}" + (f" • Dropped: {dropped}" if dropped else "")
-    new_last_reset = reset_clicks if clicked_now else last_reset
-    return fig, basis, last_dims, new_last_reset, status
+    return fig, basis, last_dims, status
 
 if __name__ == "__main__":
     # Dev mode (useful for quick testing). For production, run via gunicorn below.
