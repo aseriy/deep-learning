@@ -235,7 +235,7 @@ def refresh(_n, n_out, basis, last_dims):
     # Load latest centroids
     meta, X = load_centroids()
     if X is None or meta.empty:
-        fig = px.scatter(x=[], y=[])
+        fig = px.scatter(x=[], y=[], template="plotly_white")
         return fig, basis, last_dims, "No data"
 
     # Refit PCA on every refresh so axes follow the latest data
@@ -252,7 +252,7 @@ def refresh(_n, n_out, basis, last_dims):
     if n_out == 2:
         meta["x"], meta["y"] = Y[:,0], Y[:,1]
         fig = px.scatter(meta, x="x", y="y", text=meta["cid"].astype(str),
-                         title="Centroids (PCA refit each refresh)")
+                         title="Centroids (PCA refit each refresh)", template="plotly_white")
         fig.update_traces(marker=dict(size=16, symbol="x"), textposition="top center")
 
         # Circles sized by cluster member counts (area ∝ count)
@@ -281,15 +281,15 @@ def refresh(_n, n_out, basis, last_dims):
     else:
         meta["x"], meta["y"], meta["z"] = Y[:,0], Y[:,1], Y[:,2]
         fig = px.scatter_3d(meta, x="x", y="y", z="z", text=meta["cid"].astype(str),
-                            title="Centroids (PCA refit each refresh)")
+                            title="Centroids (PCA refit each refresh)", template="plotly_white")
 
         # Scale marker sizes by √count (proxy for circle area)
         s_counts = np.array([counts.get(int(cid), 0) for cid in meta["cid"]], dtype=float)
         if s_counts.max() > 0:
             sizes = 6.0 + 24.0 * (np.sqrt(s_counts) / np.sqrt(s_counts.max()))
-            fig.update_traces(marker=dict(size=sizes, symbol="x"))
+            fig.update_traces(marker=dict(size=sizes))
         else:
-            fig.update_traces(marker=dict(size=6, symbol="x"))
+            fig.update_traces(marker=dict(size=6))
 
     fig.update_layout(showlegend=False)
     dropped = getattr(meta, "attrs", {}).get("dropped", 0)
