@@ -153,13 +153,16 @@ def build_kmeans_model(k, batch_size, initial_centroids=None):
 def cluster_kmeans(model, vectors, verbose=False):
     model.partial_fit(vectors)
     labels = model.predict(vectors)
+
     if verbose:
         print(f"[INFO] Updated KMeans on batch of {vectors.shape[0]} rows")
+    
     return labels
 
 
-def run_kmeans_iteration(conn, table, pk, column, batch_size, verbose, dry_run, k, use_increment):
+def run_kmeans_iteration(conn, model, table, pk, column, batch_size, verbose, dry_run, k, use_increment):
     """One full KMeans iteration: fetch → init model (fresh) → partial_fit → predict → save epoch + assignments."""
+    
     # 1) fetch one DB batch
     pks, vectors = fetch_vectors(conn, table, pk, column, batch_size=batch_size, verbose=verbose)
     if vectors.size == 0:
@@ -170,9 +173,9 @@ def run_kmeans_iteration(conn, table, pk, column, batch_size, verbose, dry_run, 
     if verbose:
         print(f"[INFO] Fetched {vectors.shape[0]} rows")
 
-    # 2) fresh model INIT each batch, optionally seeded from latest centroids
-    initial = load_existing_centroids(conn, table, column, verbose=verbose) if use_increment else None
-    model = build_kmeans_model(k, batch_size, initial)
+    # # 2) fresh model INIT each batch, optionally seeded from latest centroids
+    # initial = load_existing_centroids(conn, table, column, verbose=verbose) if use_increment else None
+    # model = build_kmeans_model(k, batch_size, initial)
 
     # 3) single-batch update + labels
     labels = cluster_kmeans(model, vectors, verbose=verbose)
@@ -188,6 +191,7 @@ def run_kmeans_iteration(conn, table, pk, column, batch_size, verbose, dry_run, 
 
     if verbose:
         print(f"[INFO] Completed iteration (epoch={epoch})")
+
     return True
 
 
@@ -225,6 +229,17 @@ def main():
     conn = psycopg2.connect(args.url)
 
     if args.algorithm == "kmeans":
+
+        # 2) fresh model INIT each batch, optionally seeded from latest centroids
+        initial = None
+        if args.increment:
+            initial = load_existing_centroids(
+                                    conn,
+                                    args.table, args.input,
+                                    verbose=args.verbose
+                    )
+        model = build_kmeans_model(args.clusters, args.batch_size, initial)
+
         remaining = args.num_batches
         while True:
             if remaining is not None and remaining <= 0:
@@ -233,7 +248,9 @@ def main():
                 break
     
             processed = run_kmeans_iteration(
-                conn, args.table, args.primary_key, args.input,
+                conn, 
+                model,
+                args.table, args.primary_key, args.input,
                 batch_size=args.batch_size,
                 verbose=args.verbose,
                 dry_run=args.dry_run,
