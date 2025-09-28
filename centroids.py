@@ -15,7 +15,7 @@ from psycopg2 import errors
 from psycopg2.extras import execute_values
 
 
-def get_current_epoch(conn, table, verbose=False) -> int:
+def get_latest_epoch(conn, table, verbose=False) -> int:
     """Return the latest epoch from the centroid table (0 if none)."""
     sql = f"SELECT COALESCE(MAX(epoch), 0) FROM {table}"
     if verbose:
@@ -28,12 +28,11 @@ def get_current_epoch(conn, table, verbose=False) -> int:
 
 # --- data access helpers ---
 
-def fetch_vectors(conn, table, pk, column, batch_size, verbose=False):
+def fetch_vectors(conn, table, pk, column, batch_size, epoch, verbose=False):
     centroids_table = f"{table}_{column}_centroid"
     clusters_table  = f"{table}_{column}_clusters"
-    latest_epoch = get_current_epoch(conn, centroids_table, verbose=verbose)
     if verbose:
-        print(f"[INFO] Latest epoch: {latest_epoch}")
+        print(f"[INFO] Epoch (passed): {epoch}")
 
     sql = f"""
         SELECT s.{pk} AS pk, s.{column} AS vec
@@ -109,18 +108,17 @@ def save_cluster_assignments(conn, table, column, epoch, pks, labels, verbose=Fa
         conn.commit()
 
 
-def load_existing_centroids(conn, table, column, verbose=False):
+def load_existing_centroids(conn, table, column, epoch, verbose=False):
     centroids_table = f"{table}_{column}_centroid"
     result = None
-    latest_epoch = get_current_epoch(conn, centroids_table, verbose=verbose)
     if verbose:
-        print(f"[INFO] Latest centroid epoch: {latest_epoch}")
-    if latest_epoch:
+        print(f"[INFO] Centroid epoch (passed): {epoch}")
+    if epoch:
         sql_rows = f"SELECT id, centroid FROM {centroids_table} WHERE epoch = %s ORDER BY id"
         if verbose:
-            print(sql_rows % (latest_epoch,))
+            print(sql_rows % (epoch,))
         with conn.cursor() as cur:
-            cur.execute(sql_rows, (latest_epoch,))
+            cur.execute(sql_rows, (epoch,))
             rows = cur.fetchall()
         centroids = []
         for _cid, c in rows:
@@ -240,11 +238,11 @@ def cluster_kmeans(model, vectors, verbose=False):
     return labels
 
 
-def run_kmeans_iteration(conn, model, table, pk, column, batch_size, verbose, dry_run, k, use_increment):
+def run_kmeans_iteration(conn, model, table, pk, column, batch_size, epoch, verbose, dry_run, k, use_increment):
     """One full KMeans iteration: fetch → init model (fresh) → partial_fit → predict → save epoch + assignments."""
     
     # 1) fetch one DB batch
-    pks, vectors = fetch_vectors(conn, table, pk, column, batch_size=batch_size, verbose=verbose)
+    pks, vectors = fetch_vectors(conn, table, pk, column, batch_size=batch_size, epoch=epoch, verbose=verbose)
     if vectors.size == 0:
         if verbose:
             print("[INFO] No more vectors to process.")
@@ -254,7 +252,7 @@ def run_kmeans_iteration(conn, model, table, pk, column, batch_size, verbose, dr
         print(f"[INFO] Fetched {vectors.shape[0]} rows")
 
     # # 2) fresh model INIT each batch, optionally seeded from latest centroids
-    # initial = load_existing_centroids(conn, table, column, verbose=verbose) if use_increment else None
+    # initial = load_existing_centroids(conn, args.table, args.input, epoch, verbose=args.verbose) if args.increment else None if use_increment else None
     # model = build_kmeans_model(k, batch_size, initial)
 
     # 3) single-batch update + labels
@@ -307,6 +305,9 @@ def main():
 
     conn = psycopg2.connect(args.url)
 
+    centroids_table = f"{args.table}_{args.input}_centroid"
+    epoch = get_latest_epoch(conn, centroids_table, verbose=args.verbose)
+
     if args.algorithm == "kmeans":
 
         # 2) fresh model INIT each batch, optionally seeded from latest centroids
@@ -331,6 +332,7 @@ def main():
                 model,
                 args.table, args.primary_key, args.input,
                 batch_size=args.batch_size,
+                epoch=epoch,
                 verbose=args.verbose,
                 dry_run=args.dry_run,
                 k=args.clusters,
@@ -343,15 +345,8 @@ def main():
                 remaining -= 1
 
     else:
-        pks, vectors = fetch_vectors(conn, args.table, args.primary_key, args.input, batch_size=args.batch_size, verbose=args.verbose)
-        if vectors.size == 0:
-            if args.verbose:
-                print("[INFO] No vectors to cluster; exiting.")
-            conn.close()
-            sys.exit(0)
-        labels, _ = cluster_dbscan(vectors)
-        if args.verbose:
-            print("DBSCAN does not generate explicit centroids.")
+        print("DBSCAN is not implemented yet...")
+
     conn.close()
 
 
