@@ -8,6 +8,7 @@ from sklearn.decomposition import PCA
 
 from dash import Dash, html, dcc, Output, Input, State, no_update
 import plotly.express as px
+from datetime import datetime, timezone
 
 # ---------- CLI ----------
 def parse_cli():
@@ -91,6 +92,23 @@ def _get_current_epoch():
     if row is None:
         return None, None
     return row.epoch, row.current_at
+
+def _format_age(dt):
+    if not dt:
+        return "—"
+    now = datetime.now(timezone.utc) if dt.tzinfo else datetime.utcnow()
+    delta = now - dt
+    s = int(delta.total_seconds())
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h {m}m"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h"
 
 
 def _fetch_cluster_counts(current_epoch):
@@ -300,7 +318,7 @@ def refresh(_n, n_out, basis, last_dims):
     fig.update_layout(showlegend=False)
     dropped = getattr(meta, "attrs", {}).get("dropped", 0)
     dim = getattr(meta, "attrs", {}).get("dim", X.shape[1])
-    status = f"Centroids: {len(meta)} • Dim: {dim} • Dims out: {n_out}" + (f" • Dropped: {dropped}" if dropped else "")
+    status = f"Centroids: {len(meta)} • Dim: {dim} • Dims out: {n_out}" + (f" • Dropped: {dropped}" if dropped else "") + f" • Epoch: {current_epoch} • Age: {_format_age(current_at)}"
     return fig, basis, last_dims, status
 
 if __name__ == "__main__":
