@@ -197,6 +197,7 @@ def vectorize_batch(
 
     conn.close()
     return len(batch)
+    
 
 def main():
     warnings = []

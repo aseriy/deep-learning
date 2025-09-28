@@ -10,6 +10,9 @@ from tqdm import tqdm
 from sklearn.cluster import MiniBatchKMeans, DBSCAN
 import multiprocessing
 import ast
+import time, random
+from psycopg2 import errors
+from psycopg2.extras import execute_values
 
 
 def get_current_epoch(conn, table, verbose=False) -> int:
@@ -138,6 +141,83 @@ def load_existing_centroids(conn, table, column, verbose=False):
     return result
 
 
+# --- transactional retry + batch persistence helpers ---
+
+def run_txn_with_retry(conn, fn, max_retries=8, base_sleep=0.05, jitter=0.05):
+    """
+    Runs `fn(cur)` inside a transaction and retries on CockroachDB serializable conflicts.
+    `fn` receives a cursor and must do only transactional work (no external side effects).
+    """
+    attempt = 0
+    while True:
+        try:
+            with conn:  # opens a transaction, commits/rolls back automatically
+                with conn.cursor() as cur:
+                    return fn(cur)
+        except errors.SerializationFailure:
+            attempt += 1
+            if attempt > max_retries:
+                raise
+            sleep = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, jitter)
+            if attempt == 1:
+                print(f"[WARN] txn conflict; retrying (attempt {attempt})")
+            time.sleep(sleep)
+        except Exception:
+            raise
+
+
+def persist_batch(conn, table, column, pks, labels, centroids, verbose=False, dry_run=False):
+    """
+    Atomically:
+      - allocate fresh epoch
+      - upsert all centroids for that epoch
+      - upsert cluster assignments for all pks with that epoch
+    All inside a single retriable transaction.
+    Returns the epoch used.
+    """
+    centroids_table = f"{table}_{column}_centroid"
+    clusters_table  = f"{table}_{column}_clusters"
+    seq_name        = f"{table}_{column}_centroid_seq"
+
+    if dry_run:
+        simulated_epoch = -1
+        if verbose:
+            print(f"[DRY RUN] Would select nextval('{seq_name}') → epoch X")
+            print(f"[DRY RUN] Would UPSERT {len(centroids)} centroids into {centroids_table}")
+            print(f"[DRY RUN] Would UPSERT {len(pks)} assignments into {clusters_table}")
+        return simulated_epoch
+
+    def _txn(cur):
+        # 1) epoch
+        cur.execute("SELECT nextval(%s)", (seq_name,))
+        (epoch,) = cur.fetchone()
+        if verbose:
+            print(f"[INFO] Using epoch {epoch}")
+
+        # 2) centroids
+        centroid_rows = []
+        for i, c in enumerate(centroids):
+            vec = c.tolist() if isinstance(c, np.ndarray) else (c if isinstance(c, list) else list(c))
+            centroid_rows.append((epoch, i, vec))
+        if centroid_rows:
+            sql_cent = f"UPSERT INTO {centroids_table} (epoch, id, centroid) VALUES %s"
+            execute_values(cur, sql_cent, centroid_rows)
+            if verbose:
+                print(f"[INFO] Upserted {len(centroid_rows)} centroids")
+
+        # 3) assignments
+        assign_rows = [(pk, epoch, int(label)) for pk, label in zip(pks, labels)]
+        if assign_rows:
+            sql_assign = f"UPSERT INTO {clusters_table} (pid, epoch, cluster_id) VALUES %s"
+            execute_values(cur, sql_assign, assign_rows)
+            if verbose:
+                print(f"[INFO] Upserted {len(assign_rows)} assignments")
+
+        return epoch
+
+    return run_txn_with_retry(conn, _txn)
+
+
 # --- clustering helpers ---
 
 def build_kmeans_model(k, batch_size, initial_centroids=None):
@@ -185,9 +265,8 @@ def run_kmeans_iteration(conn, model, table, pk, column, batch_size, verbose, dr
         print(f"[INFO] Labels: {labels}")
         print(f"[INFO] Centroids shape: {centroids.shape}")
 
-    # 4) new epoch + assignments
-    epoch = save_centroids(conn, table, column, centroids, increment=True, verbose=verbose, dry_run=dry_run)
-    save_cluster_assignments(conn, table, column, epoch=epoch, pks=pks, labels=labels, verbose=verbose, dry_run=dry_run)
+    # 4) persist in a single retriable txn
+    epoch = persist_batch(conn, table, column, pks, labels, centroids, verbose=verbose, dry_run=dry_run)
 
     if verbose:
         print(f"[INFO] Completed iteration (epoch={epoch})")

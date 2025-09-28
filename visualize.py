@@ -2,7 +2,7 @@ import os, sys, argparse, json
 import array
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, MetaData, Table, select, func, cast, String, Column, Integer
+from sqlalchemy import create_engine, MetaData, Table, select, func, cast, String, Column, Integer, DateTime
 from sqlalchemy.sql.sqltypes import NullType
 from sklearn.decomposition import PCA
 
@@ -14,7 +14,8 @@ def parse_cli():
     # Parse CLI args
     p = argparse.ArgumentParser()
     p.add_argument("-u", "--url", required=True, help="CockroachDB connection URL")
-    p.add_argument("-t", "--table", required=True, help="Table with centroids")
+    p.add_argument("-t", "--table", required=True, help="Target table name")
+    p.add_argument("-c", "--column", required=True, help="Column vector column")
     p.add_argument("--poll", type=int, default=10, help="Poll seconds")
     p.add_argument("--dims", type=int, choices=[2,3], default=2, help="Output dims")
     p.add_argument("--port", type=int, default=None, help="HTTP port (fallback to $PORT or 9000)")
@@ -25,42 +26,34 @@ ENGINE = create_engine(ARGS.url, pool_pre_ping=True)
 
 # ---------- SQLAlchemy Core table definition (no reflection) ----------
 
-def _split_schema_table(qualified: str):
-    # Accept "schema.table" or just "table"
-    if "." in qualified and not qualified.startswith('"'):
-        schema, name = qualified.split(".", 1)
-        return schema, name
-    return None, qualified
-
-_SCHEMA, _TABLE_NAME = _split_schema_table(ARGS.table)
 _MD = MetaData()
+
 _T = Table(
-    _TABLE_NAME,
+    f"{ARGS.table}_{ARGS.column}_centroid",
     _MD,
     Column("id", Integer, primary_key=True),
     Column("centroid", NullType()),  # CockroachDB VECTOR; parsed manually
-    Column("epoch", Integer, primary_key=True),
-    schema=_SCHEMA,
-)
-# Derive the clusters table name from the centroid table ("*_centroid" -> "*_clusters")
-_CLUSTERS_TNAME = (
-    _TABLE_NAME.replace("_centroid", "_clusters")
-    if _TABLE_NAME.endswith("_centroid")
-    else "passage_passage_vector_clusters"
+    Column("epoch", Integer, primary_key=True)
 )
 
 _TC = Table(
-    _CLUSTERS_TNAME,
+    f"{ARGS.table}_{ARGS.column}_clusters",
     _MD,
     Column("pid", String, primary_key=True),
     Column("epoch", Integer, primary_key=True),
-    Column("cluster_id", Integer),
-    schema=_SCHEMA,
+    Column("cluster_id", Integer)
+)
+
+_TE = Table(
+    f"{ARGS.table}_{ARGS.column}_epoch",
+    _MD,
+    Column("epoch", Integer, primary_key=True),
+    Column("current_at", DateTime(timezone=True))
 )
 
 _ID_COL = _T.c.id
 _VEC_COL = _T.c.centroid
-_EPOCH_COL = _T.c.epoch
+_EPOCH_COL = _TE.c.epoch
 
 # ---------- helpers ----------
 def parse_vec(x):
@@ -89,14 +82,24 @@ def parse_vec(x):
     except Exception:
         return np.array([], dtype=float)
 
-def _fetch_cluster_counts():
-    latest_epoch = select(func.max(_EPOCH_COL)).scalar_subquery()
+
+
+def _get_current_epoch():
+    stmt = select(_TE.c.epoch, _TE.c.current_at).order_by(_TE.c.epoch.desc()).limit(1)
+    with ENGINE.connect() as conn:
+        row = conn.execute(stmt).first()
+    if row is None:
+        return None, None
+    return row.epoch, row.current_at
+
+
+def _fetch_cluster_counts(current_epoch):
     stmt = (
         select(
             _TC.c.cluster_id.label("cid"),
             func.count().label("n_members"),
         )
-        .where(_TC.c.epoch == latest_epoch)
+        .where(_TC.c.epoch == current_epoch)
         .group_by(_TC.c.cluster_id)
         .order_by(_TC.c.cluster_id)
     )
@@ -105,17 +108,16 @@ def _fetch_cluster_counts():
     # dict like {cid: n_members, ...}
     return {int(cid): int(n) for cid, n in rows}
 
-def _fetch_rows(cast_to_string: bool):
+
+def _fetch_rows(current_epoch, cast_to_string: bool):
     # Build a SQLAlchemy Core statement that selects latest epoch only
     vec_expr = cast(_VEC_COL, String) if cast_to_string else _VEC_COL
-    latest_epoch = select(func.max(_EPOCH_COL)).scalar_subquery()
-
     stmt = (
         select(
             _ID_COL.label("cid"),
             vec_expr.label("vec"),
         )
-        .where(_EPOCH_COL == latest_epoch)
+        .where(_T.c.epoch == current_epoch)
         .order_by(_ID_COL)
     )
 
@@ -144,9 +146,9 @@ def radii_from_counts_2d(meta_df, counts_by_cid, max_frac=0.10):
     return r_max * np.sqrt(counts / counts.max())
 
 
-def load_centroids():
+def load_centroids(current_epoch):
     # Try without cast first
-    rows = _fetch_rows(cast_to_string=False)
+    rows = _fetch_rows(current_epoch, cast_to_string=False)
     if not rows:
         return pd.DataFrame(), None
 
@@ -160,7 +162,7 @@ def load_centroids():
 
     # If parsing failed (all zeros), retry with ::STRING automatically
     if lens.max() == 0:
-        rows2 = _fetch_rows(cast_to_string=True)
+        rows2 = _fetch_rows(current_epoch, cast_to_string=True)
         if rows2:
             df, lens = build_df(rows2)
 
@@ -224,16 +226,20 @@ app.layout = html.Div([
     Output("graph","figure"),
     Output("pca_basis","data"),
     Output("last_basis_dims","data"),
-        Output("status","children"),
+    Output("status","children"),
     Input("poll","n_intervals"),
-        Input("dims","value"),          # <-- moved here (was State)
+    Input("dims","value"),
     State("pca_basis","data"),
     State("last_basis_dims","data"),
-        prevent_initial_call=False,
+    prevent_initial_call=False,
 )
+
+
 def refresh(_n, n_out, basis, last_dims):
+    current_epoch, current_at = _get_current_epoch()
+    
     # Load latest centroids
-    meta, X = load_centroids()
+    meta, X = load_centroids(current_epoch)
     if X is None or meta.empty:
         fig = px.scatter(x=[], y=[], template="plotly_white")
         return fig, basis, last_dims, "No data"
@@ -248,7 +254,7 @@ def refresh(_n, n_out, basis, last_dims):
     # Build figure
     meta = meta.copy()
     # Cluster sizes for latest epoch (used for circle/marker sizing)
-    counts = _fetch_cluster_counts()
+    counts = _fetch_cluster_counts(current_epoch)
     if n_out == 2:
         meta["x"], meta["y"] = Y[:,0], Y[:,1]
         fig = px.scatter(meta, x="x", y="y", text=meta["cid"].astype(str),
@@ -266,7 +272,7 @@ def refresh(_n, n_out, basis, last_dims):
                 x0=x - r, x1=x + r,
                 y0=y - r, y1=y + r,
                 line=dict(width=1, color="rgba(0,0,0,0.25)"),
-                layer="below",
+                layer="below"
             )
         # Keep units equal so circles render as true circles
         fig.update_yaxes(scaleanchor="x", scaleratio=1)
