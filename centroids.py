@@ -238,7 +238,7 @@ def cluster_kmeans(model, vectors, verbose=False):
     return labels
 
 
-def run_kmeans_iteration(conn, model, table, pk, column, batch_size, epoch, verbose, dry_run, k, use_increment):
+def run_kmeans_iteration(conn, model, table, pk, column, batch_size, epoch, verbose, dry_run, k):
     """One full KMeans iteration: fetch → init model (fresh) → partial_fit → predict → save epoch + assignments."""
     
     # 1) fetch one DB batch
@@ -250,10 +250,6 @@ def run_kmeans_iteration(conn, model, table, pk, column, batch_size, epoch, verb
 
     if verbose:
         print(f"[INFO] Fetched {vectors.shape[0]} rows")
-
-    # # 2) fresh model INIT each batch, optionally seeded from latest centroids
-    # initial = load_existing_centroids(conn, args.table, args.input, epoch, verbose=args.verbose) if args.increment else None if use_increment else None
-    # model = build_kmeans_model(k, batch_size, initial)
 
     # 3) single-batch update + labels
     labels = cluster_kmeans(model, vectors, verbose=verbose)
@@ -297,7 +293,6 @@ def main():
     group.add_argument("--progress", action="store_true", help="Show progress bar")
 
     parser.add_argument("-d", "--dry-run", action="store_true", help="Dry run mode")
-    parser.add_argument("--increment", action="store_true", help="Update latest centroid version incrementally instead of creating a new one")
     args = parser.parse_args()
 
     if args.batch_size < args.clusters:
@@ -312,11 +307,11 @@ def main():
 
         # 2) fresh model INIT each batch, optionally seeded from latest centroids
         initial = None
-        if args.increment:
-            initial = load_existing_centroids(
-                                    conn,
-                                    args.table, args.input,
-                                    verbose=args.verbose
+        initial = load_existing_centroids(
+                                conn,
+                                args.table, args.input,
+                                epoch=epoch,
+                                verbose=args.verbose
                     )
         model = build_kmeans_model(args.clusters, args.batch_size, initial)
 
@@ -335,8 +330,7 @@ def main():
                 epoch=epoch,
                 verbose=args.verbose,
                 dry_run=args.dry_run,
-                k=args.clusters,
-                use_increment=args.increment,
+                k=args.clusters
             )
             if not processed:
                 break
