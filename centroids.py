@@ -13,6 +13,10 @@ import ast
 import time, random
 from psycopg2 import errors
 from psycopg2.extras import execute_values
+import atexit
+import joblib
+from pathlib import Path
+from datetime import datetime, UTC
 
 
 def get_latest_epoch(conn, table, verbose=False) -> int:
@@ -28,28 +32,47 @@ def get_latest_epoch(conn, table, verbose=False) -> int:
 
 # --- data access helpers ---
 
-def fetch_vectors(conn, table, pk, column, batch_size, epoch, verbose=False):
+def fetch_vectors(conn, table, pk, column, batch_size, verbose=False):
     centroids_table = f"{table}_{column}_centroid"
     clusters_table  = f"{table}_{column}_clusters"
-    if verbose:
-        print(f"[INFO] Epoch (passed): {epoch}")
+    batch_size_multiplier = 10
 
-    sql = f"""
-        SELECT s.{pk} AS pk, s.{column} AS vec
-        FROM {table} AS s
-        LEFT JOIN {clusters_table} AS c
-          ON c.pid = s.{pk}
-        WHERE s.{column} IS NOT NULL
-          AND c.pid IS NULL
-        ORDER BY s.{pk} ASC
-        LIMIT {batch_size}
-    """
-    if verbose:
-        print(sql)
+    sql_0 = f"SELECT MAX({pk}) FROM {clusters_table}"
 
+    rows = []
     with conn.cursor() as cur:
-        cur.execute(sql)
+        cur.execute(sql_0)
+        (max_pk,) = cur.fetchone()
+
+        if verbose:
+            print(f"[INFO] Search for candidate vectors from {max_pk} on...")
+
+        sql_max_pk = f"AND s.{pk} > %s" if max_pk is not None else ""
+
+        sql = f"""
+            SELECT s.{pk}, s.{column}                                                
+            FROM {table} AS s                                                             
+            WHERE s.{column} IS NOT NULL  
+            {sql_max_pk}                                    
+            AND NOT EXISTS (                                                            
+            SELECT 1 FROM {clusters_table} c                           
+            WHERE c.{pk} = s.{pk}                                                       
+            )                                                                           
+            ORDER BY s.{pk}                                                             
+            LIMIT {batch_size * batch_size_multiplier}
+        """
+
+        if verbose:
+            print(sql % (max_pk,))
+
+        cur.execute(sql, (max_pk,))
         rows = cur.fetchall()
+
+    # Shuffle client-side to remove pid-order bias
+    # Use numpy RNG for reproducibility
+    rng = np.random.default_rng()
+    rng.shuffle(rows)  # in-place
+    rows = rows[:batch_size]
 
     pks, vectors = [], []
     for pk_value, v in rows:
@@ -139,6 +162,47 @@ def load_existing_centroids(conn, table, column, epoch, verbose=False):
     return result
 
 
+# --- file-based model persistence (minimal) ---
+
+def get_last_saved_model(dir_path, table, column):
+    p = Path(dir_path)
+    p.mkdir(parents=True, exist_ok=True)
+
+    files = sorted(p.glob(f"{table}_{column}.*.joblib"), key=lambda f: f.name, reverse=True)
+
+    return str(files[0]) if files else None
+
+
+def save_model(dir_path, table, column, model, compress=3):
+    p = Path(dir_path)
+    p.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")
+    filename = f"{table}_{column}.{ts}.joblib"
+    model_path = p.joinpath(filename)
+
+    if compress:
+        joblib.dump(model, model_path, compress=compress)
+    else:
+        joblib.dump(model, model_path)
+
+    return str(model_path)
+
+
+def load_model(model_path, verbose=False):
+    """Load MiniBatchKMeans from file if present; else return None."""
+
+    model = None
+
+    if model_path and os.path.exists(model_path):
+        if verbose:
+            print(f"[INFO] Loading model from {model_path}")
+
+        model = joblib.load(model_path)
+
+    return model
+
+
 # --- transactional retry + batch persistence helpers ---
 
 def run_txn_with_retry(conn, fn, max_retries=8, base_sleep=0.05, jitter=0.05):
@@ -218,13 +282,13 @@ def persist_batch(conn, table, column, pks, labels, centroids, verbose=False, dr
 
 # --- clustering helpers ---
 
-def build_kmeans_model(k, batch_size, initial_centroids=None):
+def build_kmeans_model(k, batch_size, initial_centroids=None, restarts=10, seed=42):
     return MiniBatchKMeans(
         n_clusters=k,
         batch_size=batch_size,
-        random_state=42,
+        random_state=seed,
         init=initial_centroids if initial_centroids is not None else 'k-means++',
-        n_init='auto' if initial_centroids is None else 1,
+        n_init=1 if initial_centroids is not None else restarts
     )
 
 
@@ -238,11 +302,11 @@ def cluster_kmeans(model, vectors, verbose=False):
     return labels
 
 
-def run_kmeans_iteration(conn, model, table, pk, column, batch_size, epoch, verbose, dry_run, k):
-    """One full KMeans iteration: fetch → init model (fresh) → partial_fit → predict → save epoch + assignments."""
+def run_kmeans_iteration(conn, model, table, pk, column, batch_size, verbose, dry_run, k):
+    """One full KMeans iteration: fetch → partial_fit → predict → save epoch + assignments."""
     
     # 1) fetch one DB batch
-    pks, vectors = fetch_vectors(conn, table, pk, column, batch_size=batch_size, epoch=epoch, verbose=verbose)
+    pks, vectors = fetch_vectors(conn, table, pk, column, batch_size=batch_size, verbose=verbose)
     if vectors.size == 0:
         if verbose:
             print("[INFO] No more vectors to process.")
@@ -291,8 +355,9 @@ def main():
     group = parser.add_argument_group()
     group.add_argument("-v", "--verbose", action="store_true", help="Verbose output (used for debugging)")
     group.add_argument("--progress", action="store_true", help="Show progress bar")
-
     parser.add_argument("-d", "--dry-run", action="store_true", help="Dry run mode")
+    parser.add_argument("-m", "--model", default="model", help="Path to directory to persist KMeans model")
+
     args = parser.parse_args()
 
     if args.batch_size < args.clusters:
@@ -305,15 +370,27 @@ def main():
 
     if args.algorithm == "kmeans":
 
-        # 2) fresh model INIT each batch, optionally seeded from latest centroids
-        initial = None
-        initial = load_existing_centroids(
-                                conn,
-                                args.table, args.input,
-                                epoch=epoch,
-                                verbose=args.verbose
-                    )
-        model = build_kmeans_model(args.clusters, args.batch_size, initial)
+        # Prefer file resume; else warm-start from latest DB centroids; else fresh
+        model_path = get_last_saved_model(args.model, args.table, args.input)
+        print(model_path)
+        # exit(0)
+
+        model = None
+        model = load_model(model_path, verbose=args.verbose)
+        print("Model: ", model)
+
+        # Save once on process exit
+        # register_save_on_exit(model_path, get_model=lambda: model, verbose=args.verbose)
+
+
+        if model is None:
+            initial = load_existing_centroids(
+                                    conn,
+                                    args.table, args.input,
+                                    epoch=epoch,
+                                    verbose=args.verbose
+                        )
+            model = build_kmeans_model(args.clusters, args.batch_size, initial)
 
         remaining = args.num_batches
         while True:
@@ -327,7 +404,6 @@ def main():
                 model,
                 args.table, args.primary_key, args.input,
                 batch_size=args.batch_size,
-                epoch=epoch,
                 verbose=args.verbose,
                 dry_run=args.dry_run,
                 k=args.clusters
@@ -337,6 +413,9 @@ def main():
     
             if remaining is not None:
                 remaining -= 1
+
+        model_path = save_model(args.model, args.table, args.input, model)
+        print(model_path)
 
     else:
         print("DBSCAN is not implemented yet...")
