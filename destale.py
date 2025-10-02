@@ -11,10 +11,11 @@ def destale(
         metric: str = "l2_distance",
         delete_stale: bool = True,
         verbose: bool = False, dry_run: bool = False) -> int:
-    """Re-map PIDs from `stale_epoch` in `{table}_{column}_clusters` to the nearest centroid in the latest epoch, in batches. Returns number of PIDs re-mapped."""
+    """Re-map PIDs from `stale_epoch` in `{table}_{column}_clusters` to the nearest centroid in the current epoch, in batches. Returns number of PIDs re-mapped."""
 
     clusters_table = f"{table}_{column}_clusters"
     centroids_table = f"{table}_{column}_centroid"
+    epoch_table = f"{table}_{column}_epoch"
 
     sql = f"""
         WITH stale AS (
@@ -26,7 +27,7 @@ def destale(
         ),
         latest AS (
           SELECT max(epoch) AS e
-          FROM {centroids_table}
+          FROM {epoch_table}
         )
         UPDATE {clusters_table} AS cl
         SET epoch = l.e,

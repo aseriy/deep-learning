@@ -32,41 +32,55 @@ def get_latest_epoch(conn, table, verbose=False) -> int:
 
 # --- data access helpers ---
 
-def fetch_vectors(conn, table, pk, column, batch_size, verbose=False):
+def fetch_vectors(conn, table, pk, column, start_from_pk, batch_size, verbose=False):
     centroids_table = f"{table}_{column}_centroid"
     clusters_table  = f"{table}_{column}_clusters"
     batch_size_multiplier = 10
 
-    sql_0 = f"SELECT MAX({pk}) FROM {clusters_table}"
-
     rows = []
     with conn.cursor() as cur:
-        cur.execute(sql_0)
-        (max_pk,) = cur.fetchone()
-
-        if verbose:
-            print(f"[INFO] Search for candidate vectors from {max_pk} on...")
-
-        sql_max_pk = f"AND s.{pk} > %s" if max_pk is not None else ""
-
-        sql = f"""
+        sql_0 = f"""
             SELECT s.{pk}, s.{column}                                                
             FROM {table} AS s                                                             
             WHERE s.{column} IS NOT NULL  
-            {sql_max_pk}                                    
+        """
+
+        sql_1 = f"""
             AND NOT EXISTS (                                                            
             SELECT 1 FROM {clusters_table} c                           
             WHERE c.{pk} = s.{pk}                                                       
             )                                                                           
-            ORDER BY s.{pk}                                                             
-            LIMIT {batch_size * batch_size_multiplier}
+            ORDER BY s.{pk}
         """
 
-        if verbose:
-            print(sql % (max_pk,))
+        sql_min_pk = ""
+        
+        if start_from_pk is None:
+            sql = f"""
+                {sql_0}
+                {sql_1}
+                LIMIT 1
+            """
 
-        cur.execute(sql, (max_pk,))
-        rows = cur.fetchall()
+            if verbose:
+                print(sql)
+
+            cur.execute(sql)
+            start_from_pk = cur.fetchone()[0]
+
+
+        sql_min_pk = f"AND s.{pk} > %s" if start_from_pk is not None else ""
+        sql = f"""
+            {sql_0}
+            {sql_min_pk}
+            {sql_1}
+            LIMIT {batch_size * batch_size_multiplier}
+        """
+        print(sql % (f"'{start_from_pk}'",))
+
+        cur.execute(sql, (start_from_pk,))
+        rows = cur.fetchall()        
+
 
     # Shuffle client-side to remove pid-order bias
     # Use numpy RNG for reproducibility
@@ -96,39 +110,39 @@ def fetch_vectors(conn, table, pk, column, batch_size, verbose=False):
     return pks, np.array(vectors, dtype=np.float32)
 
 
-def save_centroids(conn, table, column, centroids, increment, verbose, dry_run):
-    centroids_table = f"{table}_{column}_centroid"
-    seq_name = f"{table}_{column}_centroid_seq"
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT nextval('{seq_name}')")
-        (target_epoch,) = cur.fetchone()
-    if verbose:
-        print(f"[INFO] Saving {len(centroids)} centroids into epoch {target_epoch}")
-    sql = f"UPSERT INTO {centroids_table} (epoch, id, centroid) VALUES (%s, %s, %s)"
-    with conn.cursor() as cur:
-        for i, c in enumerate(centroids):
-            vec = c.tolist() if isinstance(c, np.ndarray) else (c if isinstance(c, list) else list(c))
-            if verbose:
-                print(sql % (target_epoch, i, vec))
-            if not dry_run:
-                cur.execute(sql, (target_epoch, i, vec))
-    if not dry_run:
-        conn.commit()
-    return target_epoch
+# def save_centroids(conn, table, column, centroids, increment, verbose, dry_run):
+#     centroids_table = f"{table}_{column}_centroid"
+#     seq_name = f"{table}_{column}_centroid_seq"
+#     with conn.cursor() as cur:
+#         cur.execute(f"SELECT nextval('{seq_name}')")
+#         (target_epoch,) = cur.fetchone()
+#     if verbose:
+#         print(f"[INFO] Saving {len(centroids)} centroids into epoch {target_epoch}")
+#     sql = f"UPSERT INTO {centroids_table} (epoch, id, centroid) VALUES (%s, %s, %s)"
+#     with conn.cursor() as cur:
+#         for i, c in enumerate(centroids):
+#             vec = c.tolist() if isinstance(c, np.ndarray) else (c if isinstance(c, list) else list(c))
+#             if verbose:
+#                 print(sql % (target_epoch, i, vec))
+#             if not dry_run:
+#                 cur.execute(sql, (target_epoch, i, vec))
+#     if not dry_run:
+#         conn.commit()
+#     return target_epoch
 
 
-def save_cluster_assignments(conn, table, column, epoch, pks, labels, verbose=False, dry_run=False):
-    clusters_table = f"{table}_{column}_clusters"
-    sql = f"UPSERT INTO {clusters_table} (pid, epoch, cluster_id) VALUES (%s, %s, %s)"
-    with conn.cursor() as cur:
-        for pk, label in zip(pks, labels):
-            cluster_id = int(label)
-            if verbose:
-                print(sql % (pk, epoch, cluster_id))
-            if not dry_run:
-                cur.execute(sql, (pk, epoch, cluster_id))
-    if not dry_run:
-        conn.commit()
+# def save_cluster_assignments(conn, table, column, epoch, pks, labels, verbose=False, dry_run=False):
+#     clusters_table = f"{table}_{column}_clusters"
+#     sql = f"UPSERT INTO {clusters_table} (pid, epoch, cluster_id) VALUES (%s, %s, %s)"
+#     with conn.cursor() as cur:
+#         for pk, label in zip(pks, labels):
+#             cluster_id = int(label)
+#             if verbose:
+#                 print(sql % (pk, epoch, cluster_id))
+#             if not dry_run:
+#                 cur.execute(sql, (pk, epoch, cluster_id))
+#     if not dry_run:
+#         conn.commit()
 
 
 def load_existing_centroids(conn, table, column, epoch, verbose=False):
@@ -302,15 +316,15 @@ def cluster_kmeans(model, vectors, verbose=False):
     return labels
 
 
-def run_kmeans_iteration(conn, model, table, pk, column, batch_size, verbose, dry_run, k):
+def run_kmeans_iteration(conn, model, table, pk, column, start_from_pk, batch_size, verbose, dry_run, k):
     """One full KMeans iteration: fetch → partial_fit → predict → save epoch + assignments."""
     
     # 1) fetch one DB batch
-    pks, vectors = fetch_vectors(conn, table, pk, column, batch_size=batch_size, verbose=verbose)
+    pks, vectors = fetch_vectors(conn, table, pk, column, start_from_pk, batch_size=batch_size, verbose=verbose)
     if vectors.size == 0:
         if verbose:
             print("[INFO] No more vectors to process.")
-        return False
+        return None
 
     if verbose:
         print(f"[INFO] Fetched {vectors.shape[0]} rows")
@@ -329,7 +343,7 @@ def run_kmeans_iteration(conn, model, table, pk, column, batch_size, verbose, dr
     if verbose:
         print(f"[INFO] Completed iteration (epoch={epoch})")
 
-    return True
+    return pks[0]
 
 
 def cluster_dbscan(vectors):
@@ -370,6 +384,13 @@ def main():
 
     if args.algorithm == "kmeans":
 
+        os.environ["OMP_NUM_THREADS"] = str(len(os.sched_getaffinity(0)))   # OpenMP (MiniBatchKMeans)
+        os.environ["OPENBLAS_NUM_THREADS"] = "1"                            # keep BLAS single-threaded
+        os.environ["MKL_NUM_THREADS"] = "1"
+
+        if args.verbose:
+            print(f"[INFO] Utilizing {os.environ["OMP_NUM_THREADS"]} CPU cores")
+
         # Prefer file resume; else warm-start from latest DB centroids; else fresh
         model_path = get_last_saved_model(args.model, args.table, args.input)
         print(model_path)
@@ -393,22 +414,30 @@ def main():
             model = build_kmeans_model(args.clusters, args.batch_size, initial)
 
         remaining = args.num_batches
+        first_pk = None
         while True:
             if remaining is not None and remaining <= 0:
                 if args.verbose:
                     print(f"[INFO] Reached requested iterations: {args.num_batches}")
                 break
     
-            processed = run_kmeans_iteration(
+            first_pk = run_kmeans_iteration(
                 conn, 
                 model,
-                args.table, args.primary_key, args.input,
+                args.table,
+                args.primary_key,
+                args.input,
+                first_pk,
                 batch_size=args.batch_size,
                 verbose=args.verbose,
                 dry_run=args.dry_run,
                 k=args.clusters
             )
-            if not processed:
+
+            if args.verbose:
+                print(f"[INFO] First PK = '{first_pk}'")
+
+            if first_pk is None:
                 break
     
             if remaining is not None:
