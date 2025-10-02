@@ -30,57 +30,67 @@ def get_latest_epoch(conn, table, verbose=False) -> int:
     return int(epoch or 0)
 
 
-# --- data access helpers ---
+def bucket_vector_pks(conn, table, pk, batch_size, verbose=False):
+    concurrency = os.environ["OMP_NUM_THREADS"]
 
-def fetch_vectors(conn, table, pk, column, start_from_pk, batch_size, verbose=False):
+    sql = f"""
+        WITH b AS (                                                                   
+            SELECT {pk}, NTILE({concurrency}) OVER (ORDER BY {pk}) AS bucket                         
+            FROM {table}                                                                
+        )                                                                             
+        SELECT
+            bucket,
+            MIN({pk}) AS start_pk,
+            MAX({pk}) AS end_pk,
+            COUNT(*) AS rows_in_bucket
+            FROM b
+            GROUP BY bucket
+            ORDER BY bucket
+    """
+
+    if verbose:
+        print(f"[INFO] {sql}")
+
+    buckets = None
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        buckets = cur.fetchall()
+
+    # print(json.dumps(rows, indent=2))
+    return buckets
+
+
+
+def fetch_vectors(
+            conn, table, pk, column,
+            pk_start, pk_end,
+            batch_size, verbose=False):
+
     centroids_table = f"{table}_{column}_centroid"
     clusters_table  = f"{table}_{column}_clusters"
-    batch_size_multiplier = 10
+    # batch_size_multiplier = 10
 
-    rows = []
+
+    sql = f"""
+            SELECT s.{pk}, s.{column}
+            FROM {table} AS s
+            WHERE s.{column} IS NOT NULL
+            AND s.{pk} BETWEEN %s AND %s
+            AND NOT EXISTS (
+                SELECT 1 FROM {clusters_table} c
+                WHERE c.{pk} = s.{pk}                  
+            )
+            ORDER BY s.{pk}                                                
+            LIMIT {batch_size}
+        """
+
+    if verbose:
+        print("[INFO] ", sql % (f"'{pk_start}'", f"'{pk_end}"))
+
+    rows = None
     with conn.cursor() as cur:
-        sql_0 = f"""
-            SELECT s.{pk}, s.{column}                                                
-            FROM {table} AS s                                                             
-            WHERE s.{column} IS NOT NULL  
-        """
-
-        sql_1 = f"""
-            AND NOT EXISTS (                                                            
-            SELECT 1 FROM {clusters_table} c                           
-            WHERE c.{pk} = s.{pk}                                                       
-            )                                                                           
-            ORDER BY s.{pk}
-        """
-
-        sql_min_pk = ""
-        
-        if start_from_pk is None:
-            sql = f"""
-                {sql_0}
-                {sql_1}
-                LIMIT 1
-            """
-
-            if verbose:
-                print(sql)
-
-            cur.execute(sql)
-            start_from_pk = cur.fetchone()[0]
-
-
-        sql_min_pk = f"AND s.{pk} > %s" if start_from_pk is not None else ""
-        sql = f"""
-            {sql_0}
-            {sql_min_pk}
-            {sql_1}
-            LIMIT {batch_size * batch_size_multiplier}
-        """
-        print(sql % (f"'{start_from_pk}'",))
-
-        cur.execute(sql, (start_from_pk,))
+        cur.execute(sql, (pk_start,pk_end))
         rows = cur.fetchall()        
-
 
     # Shuffle client-side to remove pid-order bias
     # Use numpy RNG for reproducibility
@@ -108,41 +118,6 @@ def fetch_vectors(conn, table, pk, column, start_from_pk, batch_size, verbose=Fa
                 print(f"[WARN] Skipping row {pk_value}: {e}")
 
     return pks, np.array(vectors, dtype=np.float32)
-
-
-# def save_centroids(conn, table, column, centroids, increment, verbose, dry_run):
-#     centroids_table = f"{table}_{column}_centroid"
-#     seq_name = f"{table}_{column}_centroid_seq"
-#     with conn.cursor() as cur:
-#         cur.execute(f"SELECT nextval('{seq_name}')")
-#         (target_epoch,) = cur.fetchone()
-#     if verbose:
-#         print(f"[INFO] Saving {len(centroids)} centroids into epoch {target_epoch}")
-#     sql = f"UPSERT INTO {centroids_table} (epoch, id, centroid) VALUES (%s, %s, %s)"
-#     with conn.cursor() as cur:
-#         for i, c in enumerate(centroids):
-#             vec = c.tolist() if isinstance(c, np.ndarray) else (c if isinstance(c, list) else list(c))
-#             if verbose:
-#                 print(sql % (target_epoch, i, vec))
-#             if not dry_run:
-#                 cur.execute(sql, (target_epoch, i, vec))
-#     if not dry_run:
-#         conn.commit()
-#     return target_epoch
-
-
-# def save_cluster_assignments(conn, table, column, epoch, pks, labels, verbose=False, dry_run=False):
-#     clusters_table = f"{table}_{column}_clusters"
-#     sql = f"UPSERT INTO {clusters_table} (pid, epoch, cluster_id) VALUES (%s, %s, %s)"
-#     with conn.cursor() as cur:
-#         for pk, label in zip(pks, labels):
-#             cluster_id = int(label)
-#             if verbose:
-#                 print(sql % (pk, epoch, cluster_id))
-#             if not dry_run:
-#                 cur.execute(sql, (pk, epoch, cluster_id))
-#     if not dry_run:
-#         conn.commit()
 
 
 def load_existing_centroids(conn, table, column, epoch, verbose=False):
@@ -296,14 +271,14 @@ def persist_batch(conn, table, column, pks, labels, centroids, verbose=False, dr
 
 # --- clustering helpers ---
 
-def build_kmeans_model(k, batch_size, initial_centroids=None, restarts=10, seed=42):
-    return MiniBatchKMeans(
-        n_clusters=k,
-        batch_size=batch_size,
-        random_state=seed,
-        init=initial_centroids if initial_centroids is not None else 'k-means++',
-        n_init=1 if initial_centroids is not None else restarts
-    )
+# def build_kmeans_model(k, batch_size, initial_centroids=None, restarts=10, seed=42):
+#     return MiniBatchKMeans(
+#         n_clusters=k,
+#         batch_size=batch_size,
+#         random_state=seed,
+#         init=initial_centroids if initial_centroids is not None else 'k-means++',
+#         n_init=1 if initial_centroids is not None else restarts
+#     )
 
 
 def cluster_kmeans(model, vectors, verbose=False):
@@ -316,21 +291,36 @@ def cluster_kmeans(model, vectors, verbose=False):
     return labels
 
 
-def run_kmeans_iteration(conn, model, table, pk, column, start_from_pk, batch_size, verbose, dry_run, k):
+def run_kmeans_iteration(
+                conn,
+                model, table, pk, column, start_from_pk,
+                pk_buckets,
+                batch_size, verbose, dry_run, k
+            ):
     """One full KMeans iteration: fetch → partial_fit → predict → save epoch + assignments."""
     
     # 1) fetch one DB batch
-    pks, vectors = fetch_vectors(conn, table, pk, column, start_from_pk, batch_size=batch_size, verbose=verbose)
-    if vectors.size == 0:
+    all_pks = []
+    all_vectors = None
+
+    for bucket in pk_buckets:
+        pks, vectors = fetch_vectors (
+                    conn, table, pk, column, bucket[1], bucket[2],
+                    batch_size=batch_size, verbose=verbose
+                )
+        all_pks.extend(pks)
+        all_vectors = vectors if all_vectors is None else np.concatenate([all_vectors, vectors], axis=0)
+
+    if all_vectors.size == 0:
         if verbose:
             print("[INFO] No more vectors to process.")
         return None
 
     if verbose:
-        print(f"[INFO] Fetched {vectors.shape[0]} rows")
+        print(f"[INFO] Fetched {all_vectors.shape[0]} rows")
 
     # 3) single-batch update + labels
-    labels = cluster_kmeans(model, vectors, verbose=verbose)
+    labels = cluster_kmeans(model, all_vectors, verbose=verbose)
     centroids = model.cluster_centers_
 
     if verbose:
@@ -338,12 +328,12 @@ def run_kmeans_iteration(conn, model, table, pk, column, start_from_pk, batch_si
         print(f"[INFO] Centroids shape: {centroids.shape}")
 
     # 4) persist in a single retriable txn
-    epoch = persist_batch(conn, table, column, pks, labels, centroids, verbose=verbose, dry_run=dry_run)
+    epoch = persist_batch(conn, table, column, all_pks, labels, centroids, verbose=verbose, dry_run=dry_run)
 
     if verbose:
         print(f"[INFO] Completed iteration (epoch={epoch})")
 
-    return pks[0]
+    return all_pks[0]
 
 
 def cluster_dbscan(vectors):
@@ -360,7 +350,7 @@ def main():
     parser.add_argument("-t", "--table", required=True, help="Table name containing vectors")
     parser.add_argument("-p", "--primary-key", required=True, help="Primary key of the table name containing vectors")
     parser.add_argument("-i", "--input", required=True, help="Column containing vector embeddings")
-    parser.add_argument("-a", "--algorithm", choices=["kmeans", "dbscan"], default="kmeans", help="Clustering algorithm to use")
+    # parser.add_argument("-a", "--algorithm", choices=["kmeans", "dbscan"], default="kmeans", help="Clustering algorithm to use")
     parser.add_argument("-c", "--clusters", type=int, default=8, help="Number of clusters (only for KMeans)")
     parser.add_argument("-w", "--workers", type=int, default=multiprocessing.cpu_count(), help="Number of parallel workers (not yet used)")
     parser.add_argument("-b", "--batch-size", type=int, default=1000, help="Batch size for processing rows")
@@ -382,72 +372,91 @@ def main():
     centroids_table = f"{args.table}_{args.input}_centroid"
     epoch = get_latest_epoch(conn, centroids_table, verbose=args.verbose)
 
-    if args.algorithm == "kmeans":
+    # if args.algorithm == "kmeans":
 
-        os.environ["OMP_NUM_THREADS"] = str(len(os.sched_getaffinity(0)))   # OpenMP (MiniBatchKMeans)
-        os.environ["OPENBLAS_NUM_THREADS"] = "1"                            # keep BLAS single-threaded
-        os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OMP_NUM_THREADS"] = str(len(os.sched_getaffinity(0)))   # OpenMP (MiniBatchKMeans)
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"                            # keep BLAS single-threaded
+    os.environ["MKL_NUM_THREADS"] = "1"
+
+    if args.verbose:
+        print(f"[INFO] Utilizing {os.environ["OMP_NUM_THREADS"]} CPU cores")
+
+    # Prefer file resume; else warm-start from latest DB centroids; else fresh
+    model_path = get_last_saved_model(args.model, args.table, args.input)
+    if args.verbose:
+        print(f"[INFO] Loading last saved mode from {model_path}")
+
+    model = None
+    model = load_model(model_path, verbose=args.verbose)
+    if args.verbose:
+        print(f"[INFO] Model: {model}")
+
+    # Save once on process exit
+    # register_save_on_exit(model_path, get_model=lambda: model, verbose=args.verbose)
+
+
+    if model is None:
+        initial = load_existing_centroids(
+                                conn,
+                                args.table, args.input,
+                                epoch=epoch,
+                                verbose=args.verbose
+                    )
+        model = MiniBatchKMeans(
+            n_clusters=args.clusters,
+            batch_size=args.batch_size,
+            random_state=42,
+            init=initial if initial is not None else 'k-means++',
+            n_init=1 if initial is not None else 10
+        )
+
+    remaining = args.num_batches
+
+    # TODO: This may need to go once the bucketing is implemented
+    first_pk = None
+
+    # In order to build vector batched in parallel, we bucket the entire
+    # {table}.{primary_key} value space into the number of buckets, where
+    # number of buckets is a multiple of the number of CPU's available to
+    # this process.
+    pk_buckets = bucket_vector_pks(conn, args.table, args.primary_key, args.batch_size, args.verbose)
+
+    while True:
+        if remaining is not None and remaining <= 0:
+            if args.verbose:
+                print(f"[INFO] Reached requested iterations: {args.num_batches}")
+            break
+
+        first_pk = run_kmeans_iteration(
+            conn, 
+            model,
+            args.table,
+            args.primary_key,
+            args.input,
+            first_pk,
+            pk_buckets,
+            batch_size=args.batch_size,
+            verbose=args.verbose,
+            dry_run=args.dry_run,
+            k=args.clusters
+        )
 
         if args.verbose:
-            print(f"[INFO] Utilizing {os.environ["OMP_NUM_THREADS"]} CPU cores")
+            print(f"[INFO] First PK = '{first_pk}'")
 
-        # Prefer file resume; else warm-start from latest DB centroids; else fresh
-        model_path = get_last_saved_model(args.model, args.table, args.input)
-        print(model_path)
-        # exit(0)
+        if first_pk is None:
+            break
 
-        model = None
-        model = load_model(model_path, verbose=args.verbose)
-        print("Model: ", model)
-
-        # Save once on process exit
-        # register_save_on_exit(model_path, get_model=lambda: model, verbose=args.verbose)
+        if remaining is not None:
+            remaining -= 1
 
 
-        if model is None:
-            initial = load_existing_centroids(
-                                    conn,
-                                    args.table, args.input,
-                                    epoch=epoch,
-                                    verbose=args.verbose
-                        )
-            model = build_kmeans_model(args.clusters, args.batch_size, initial)
+    if args.verbose:
+        print(f"[INFO] Saving mode to {model_path}")
+    model_path = save_model(args.model, args.table, args.input, model)
 
-        remaining = args.num_batches
-        first_pk = None
-        while True:
-            if remaining is not None and remaining <= 0:
-                if args.verbose:
-                    print(f"[INFO] Reached requested iterations: {args.num_batches}")
-                break
-    
-            first_pk = run_kmeans_iteration(
-                conn, 
-                model,
-                args.table,
-                args.primary_key,
-                args.input,
-                first_pk,
-                batch_size=args.batch_size,
-                verbose=args.verbose,
-                dry_run=args.dry_run,
-                k=args.clusters
-            )
-
-            if args.verbose:
-                print(f"[INFO] First PK = '{first_pk}'")
-
-            if first_pk is None:
-                break
-    
-            if remaining is not None:
-                remaining -= 1
-
-        model_path = save_model(args.model, args.table, args.input, model)
-        print(model_path)
-
-    else:
-        print("DBSCAN is not implemented yet...")
+    # else:
+    #     print("DBSCAN is not implemented yet...")
 
     conn.close()
 
