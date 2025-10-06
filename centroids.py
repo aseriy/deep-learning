@@ -17,6 +17,10 @@ import atexit
 import joblib
 from pathlib import Path
 from datetime import datetime, UTC
+import grpc
+from gen import kmeans_pb2 as pb2
+from gen import kmeans_pb2_grpc as pb2_grpc
+import pickle
 
 
 def get_latest_epoch(conn, table, verbose=False) -> int:
@@ -94,30 +98,32 @@ def fetch_vectors(
 
     # Shuffle client-side to remove pid-order bias
     # Use numpy RNG for reproducibility
-    rng = np.random.default_rng()
-    rng.shuffle(rows)  # in-place
-    rows = rows[:batch_size]
+    # rng = np.random.default_rng()
+    # rng.shuffle(rows)  # in-place
+    # rows = rows[:batch_size]
 
-    pks, vectors = [], []
-    for pk_value, v in rows:
-        try:
-            if isinstance(v, list):
-                vec = v
-            elif isinstance(v, np.ndarray):
-                vec = v.tolist()
-            elif isinstance(v, str):
-                vec = json.loads(v)
-                if not isinstance(vec, list):
-                    raise ValueError("parsed JSON is not a list")
-            else:
-                vec = list(v)
-            pks.append(pk_value)
-            vectors.append(vec)
-        except Exception as e:
-            if verbose:
-                print(f"[WARN] Skipping row {pk_value}: {e}")
+    # pks, vectors = [], []
+    # for pk_value, v in rows:
+    #     try:
+    #         if isinstance(v, list):
+    #             vec = v
+    #         elif isinstance(v, np.ndarray):
+    #             vec = v.tolist()
+    #         elif isinstance(v, str):
+    #             vec = json.loads(v)
+    #             if not isinstance(vec, list):
+    #                 raise ValueError("parsed JSON is not a list")
+    #         else:
+    #             vec = list(v)
+    #         pks.append(pk_value)
+    #         vectors.append(vec)
+    #     except Exception as e:
+    #         if verbose:
+    #             print(f"[WARN] Skipping row {pk_value}: {e}")
 
-    return pks, np.array(vectors, dtype=np.float32)
+    # return pks, np.array(vectors, dtype=np.float32)
+    return rows
+
 
 
 def load_existing_centroids(conn, table, column, epoch, verbose=False):
@@ -269,16 +275,6 @@ def persist_batch(conn, table, column, pks, labels, centroids, verbose=False, dr
     return run_txn_with_retry(conn, _txn)
 
 
-# --- clustering helpers ---
-
-# def build_kmeans_model(k, batch_size, initial_centroids=None, restarts=10, seed=42):
-#     return MiniBatchKMeans(
-#         n_clusters=k,
-#         batch_size=batch_size,
-#         random_state=seed,
-#         init=initial_centroids if initial_centroids is not None else 'k-means++',
-#         n_init=1 if initial_centroids is not None else restarts
-#     )
 
 
 def cluster_kmeans(model, vectors, verbose=False):
@@ -293,47 +289,92 @@ def cluster_kmeans(model, vectors, verbose=False):
 
 def run_kmeans_iteration(
                 conn,
-                model, table, pk, column, start_from_pk,
+                model, table, pk, column,
                 pk_buckets,
                 batch_size, verbose, dry_run, k
             ):
     """One full KMeans iteration: fetch → partial_fit → predict → save epoch + assignments."""
     
     # 1) fetch one DB batch
-    all_pks = []
-    all_vectors = None
+    all_rows = []
 
     for bucket in pk_buckets:
-        pks, vectors = fetch_vectors (
+        rows = fetch_vectors (
                     conn, table, pk, column, bucket[1], bucket[2],
                     batch_size=batch_size, verbose=verbose
                 )
-        all_pks.extend(pks)
-        all_vectors = vectors if all_vectors is None else np.concatenate([all_vectors, vectors], axis=0)
+        # print(rows)
+        all_rows.extend(rows)
+        # # all_vectors = vectors if all_vectors is None else np.concatenate([all_vectors, vectors], axis=0)
+        # all_vectors.extend(vectors)
 
-    if all_vectors.size == 0:
+
+
+    if len(all_rows) == 0:
         if verbose:
             print("[INFO] No more vectors to process.")
         return None
 
+    # Shuffle client-side to remove pid-order bias
+    # Use numpy RNG for reproducibility
+    rng = np.random.default_rng()
+    rng.shuffle(all_rows)  # in-place
+    # all_rows = all_rows[:batch_size]
+
+
+
+    pks, vectors = [], []
+    for pk_value, v in rows:
+        try:
+            if isinstance(v, list):
+                vec = v
+            elif isinstance(v, np.ndarray):
+                vec = v.tolist()
+            elif isinstance(v, str):
+                vec = json.loads(v)
+                if not isinstance(vec, list):
+                    raise ValueError("parsed JSON is not a list")
+            else:
+                vec = list(v)
+
+            pks.append(pk_value)
+            vectors.append(vec)
+
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] Skipping row {pk_value}: {e}")
+
     if verbose:
-        print(f"[INFO] Fetched {all_vectors.shape[0]} rows")
+        print(f"[INFO] Fetched {len(all_rows)} rows")
 
-    # 3) single-batch update + labels
-    labels = cluster_kmeans(model, all_vectors, verbose=verbose)
-    centroids = model.cluster_centers_
+    batch = pb2.VectorBatch(
+            data = pickle.dumps((pks, vectors), protocol=pickle.HIGHEST_PROTOCOL)
+        )
+    with grpc.insecure_channel("localhost:50051") as channel:
+        stub = pb2_grpc.KmeansStub(channel)
+        future = stub.PutVectorBatch.future(batch)
+        result = future.result()
+        print(result)
 
-    if verbose:
-        print(f"[INFO] Labels: {labels}")
-        print(f"[INFO] Centroids shape: {centroids.shape}")
 
-    # 4) persist in a single retriable txn
-    epoch = persist_batch(conn, table, column, all_pks, labels, centroids, verbose=verbose, dry_run=dry_run)
+    # TODO: This below functionality has been moved to the Kmeans Server
+    #
+    #
+    # # 3) single-batch update + labels
+    # labels = cluster_kmeans(model, all_vectors, verbose=verbose)
+    # centroids = model.cluster_centers_
 
-    if verbose:
-        print(f"[INFO] Completed iteration (epoch={epoch})")
+    # if verbose:
+    #     print(f"[INFO] Labels: {labels}")
+    #     print(f"[INFO] Centroids shape: {centroids.shape}")
 
-    return all_pks[0]
+    # # 4) persist in a single retriable txn
+    # epoch = persist_batch(conn, table, column, all_pks, labels, centroids, verbose=verbose, dry_run=dry_run)
+
+    # if verbose:
+    #     print(f"[INFO] Completed iteration (epoch={epoch})")
+
+    return None
 
 
 def cluster_dbscan(vectors):
@@ -379,7 +420,7 @@ def main():
     os.environ["MKL_NUM_THREADS"] = "1"
 
     if args.verbose:
-        print(f"[INFO] Utilizing {os.environ["OMP_NUM_THREADS"]} CPU cores")
+        print(f"[INFO] Utilizing {os.environ['OMP_NUM_THREADS']} CPU cores")
 
     # Prefer file resume; else warm-start from latest DB centroids; else fresh
     model_path = get_last_saved_model(args.model, args.table, args.input)
@@ -427,13 +468,12 @@ def main():
                 print(f"[INFO] Reached requested iterations: {args.num_batches}")
             break
 
-        first_pk = run_kmeans_iteration(
+        run_kmeans_iteration(
             conn, 
             model,
             args.table,
             args.primary_key,
             args.input,
-            first_pk,
             pk_buckets,
             batch_size=args.batch_size,
             verbose=args.verbose,

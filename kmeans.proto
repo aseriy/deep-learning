@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package Kmeans;
+
+// The Kmeans service definition.
+service Kmeans {
+  // Receives a batch of vectors for clustering.
+  rpc PutVectorBatch (VectorBatch) returns (VectorBatchAck);
+}
+
+// Messages
+message VectorBatch {
+  bytes data = 1;
+}
+
+message VectorBatchAck {
+  bool ok = 1;
+}
