@@ -24,17 +24,17 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0ckmeans.proto\x12\x06Kmeans\"\x1b\n\x0bVectorBatch\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\"\x1c\n\x0eVectorBatchAck\x12\n\n\x02ok\x18\x01 \x01(\x08\x32G\n\x06Kmeans\x12=\n\x0ePutVectorBatch\x12\x13.Kmeans.VectorBatch\x1a\x16.Kmeans.VectorBatchAckb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0ckmeans.proto\x12\x06Kmeans\"&\n\x08PkVector\x12\n\n\x02pk\x18\x01 \x01(\t\x12\x0e\n\x06vector\x18\x02 \x03(\x02\"\x19\n\x0bPkVectorAck\x12\n\n\x02ok\x18\x01 \x01(\x08\x32@\n\x06Kmeans\x12\x36\n\x0bPutPkVector\x12\x10.Kmeans.PkVector\x1a\x13.Kmeans.PkVectorAck(\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'kmeans_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_VECTORBATCH']._serialized_start=24
-  _globals['_VECTORBATCH']._serialized_end=51
-  _globals['_VECTORBATCHACK']._serialized_start=53
-  _globals['_VECTORBATCHACK']._serialized_end=81
-  _globals['_KMEANS']._serialized_start=83
-  _globals['_KMEANS']._serialized_end=154
+  _globals['_PKVECTOR']._serialized_start=24
+  _globals['_PKVECTOR']._serialized_end=62
+  _globals['_PKVECTORACK']._serialized_start=64
+  _globals['_PKVECTORACK']._serialized_end=89
+  _globals['_KMEANS']._serialized_start=91
+  _globals['_KMEANS']._serialized_end=155
 # @@protoc_insertion_point(module_scope)

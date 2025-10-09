@@ -277,14 +277,14 @@ def persist_batch(conn, table, column, pks, labels, centroids, verbose=False, dr
 
 
 
-def cluster_kmeans(model, vectors, verbose=False):
-    model.partial_fit(vectors)
-    labels = model.predict(vectors)
+# def cluster_kmeans(model, vectors, verbose=False):
+#     model.partial_fit(vectors)
+#     labels = model.predict(vectors)
 
-    if verbose:
-        print(f"[INFO] Updated KMeans on batch of {vectors.shape[0]} rows")
+#     if verbose:
+#         print(f"[INFO] Updated KMeans on batch of {vectors.shape[0]} rows")
     
-    return labels
+#     return labels
 
 
 def run_kmeans_iteration(
@@ -324,7 +324,7 @@ def run_kmeans_iteration(
 
 
     pks, vectors = [], []
-    for pk_value, v in rows:
+    for pk_value, v in all_rows:
         try:
             if isinstance(v, list):
                 vec = v
@@ -344,17 +344,24 @@ def run_kmeans_iteration(
             if verbose:
                 print(f"[WARN] Skipping row {pk_value}: {e}")
 
+
     if verbose:
         print(f"[INFO] Fetched {len(all_rows)} rows")
 
-    batch = pb2.VectorBatch(
-            data = pickle.dumps((pks, vectors), protocol=pickle.HIGHEST_PROTOCOL)
-        )
+
+    # future = stub.PutVectorBatch.future(batch)
+    # resp = future.resp()
     with grpc.insecure_channel("localhost:50051") as channel:
+        def request_iter():
+            for pk, vector in zip(pks, vectors):
+                # print(pk)
+                # print(vector)
+                yield pb2.PkVector(pk=pk, vector=vector)
+
         stub = pb2_grpc.KmeansStub(channel)
-        future = stub.PutVectorBatch.future(batch)
-        result = future.result()
-        print(result)
+        resp = stub.PutPkVector(request_iter(), timeout=60)
+        print(resp)
+
 
 
     # TODO: This below functionality has been moved to the Kmeans Server
@@ -377,10 +384,10 @@ def run_kmeans_iteration(
     return None
 
 
-def cluster_dbscan(vectors):
-    model = DBSCAN()
-    labels = model.fit_predict(vectors)
-    return labels, None
+# def cluster_dbscan(vectors):
+#     model = DBSCAN()
+#     labels = model.fit_predict(vectors)
+#     return labels, None
 
 
 # --- main ---
@@ -491,9 +498,9 @@ def main():
             remaining -= 1
 
 
-    if args.verbose:
-        print(f"[INFO] Saving mode to {model_path}")
-    model_path = save_model(args.model, args.table, args.input, model)
+    # if args.verbose:
+    #     print(f"[INFO] Saving mode to {model_path}")
+    # model_path = save_model(args.model, args.table, args.input, model)
 
     # else:
     #     print("DBSCAN is not implemented yet...")

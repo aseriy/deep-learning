@@ -3,6 +3,8 @@ import grpc
 from gen import kmeans_pb2 as pb2
 from gen import kmeans_pb2_grpc as pb2_grpc
 import pickle
+import time
+import itertools
 
 
 def run():
@@ -22,20 +24,28 @@ def run():
         [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
     ]
 
-    batch = pb2.VectorBatch(
-        data = pickle.dumps((pks, vectors), protocol=pickle.HIGHEST_PROTOCOL)
-    )
-    print(batch)
+    # batch = pb2.VectorBatch(
+    #     data = pickle.dumps((pks, vectors), protocol=pickle.HIGHEST_PROTOCOL)
+    # )
+    # print(batch)
+
+
 
 
     with grpc.insecure_channel("localhost:50051") as channel:
+        def request_iter():
+            for pk, vector in zip(pks, vectors):
+                print(pk)
+                print(vector)
+                yield pb2.PkVector(pk=pk, vector=vector)
+
         stub = pb2_grpc.KmeansStub(channel)
-        future = stub.PutVectorBatch.future(batch)
-        result = future.result()
-        print(result)
+        resp = stub.PutPkVector(request_iter(), timeout=60)
+        print(resp)
 
 
 if __name__ == '__main__':
     logging.basicConfig()
-    run()
-    
+    for i in range(1000):
+        run()
+        # time.sleep(3)

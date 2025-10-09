@@ -35,10 +35,10 @@ class KmeansStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.PutVectorBatch = channel.unary_unary(
-                '/Kmeans.Kmeans/PutVectorBatch',
-                request_serializer=kmeans__pb2.VectorBatch.SerializeToString,
-                response_deserializer=kmeans__pb2.VectorBatchAck.FromString,
+        self.PutPkVector = channel.stream_unary(
+                '/Kmeans.Kmeans/PutPkVector',
+                request_serializer=kmeans__pb2.PkVector.SerializeToString,
+                response_deserializer=kmeans__pb2.PkVectorAck.FromString,
                 _registered_method=True)
 
 
@@ -46,7 +46,7 @@ class KmeansServicer(object):
     """The Kmeans service definition.
     """
 
-    def PutVectorBatch(self, request, context):
+    def PutPkVector(self, request_iterator, context):
         """Receives a batch of vectors for clustering.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -56,10 +56,10 @@ class KmeansServicer(object):
 
 def add_KmeansServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'PutVectorBatch': grpc.unary_unary_rpc_method_handler(
-                    servicer.PutVectorBatch,
-                    request_deserializer=kmeans__pb2.VectorBatch.FromString,
-                    response_serializer=kmeans__pb2.VectorBatchAck.SerializeToString,
+            'PutPkVector': grpc.stream_unary_rpc_method_handler(
+                    servicer.PutPkVector,
+                    request_deserializer=kmeans__pb2.PkVector.FromString,
+                    response_serializer=kmeans__pb2.PkVectorAck.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -74,7 +74,7 @@ class Kmeans(object):
     """
 
     @staticmethod
-    def PutVectorBatch(request,
+    def PutPkVector(request_iterator,
             target,
             options=(),
             channel_credentials=None,
@@ -84,12 +84,12 @@ class Kmeans(object):
             wait_for_ready=None,
             timeout=None,
             metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
+        return grpc.experimental.stream_unary(
+            request_iterator,
             target,
-            '/Kmeans.Kmeans/PutVectorBatch',
-            kmeans__pb2.VectorBatch.SerializeToString,
-            kmeans__pb2.VectorBatchAck.FromString,
+            '/Kmeans.Kmeans/PutPkVector',
+            kmeans__pb2.PkVector.SerializeToString,
+            kmeans__pb2.PkVectorAck.FromString,
             options,
             channel_credentials,
             insecure,

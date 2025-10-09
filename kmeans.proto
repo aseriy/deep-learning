@@ -5,14 +5,15 @@ package Kmeans;
 // The Kmeans service definition.
 service Kmeans {
   // Receives a batch of vectors for clustering.
-  rpc PutVectorBatch (VectorBatch) returns (VectorBatchAck);
+  rpc PutPkVector (stream PkVector) returns (PkVectorAck);
 }
 
 // Messages
-message VectorBatch {
-  bytes data = 1;
+message PkVector {
+  string pk = 1;
+  repeated float vector = 2;
 }
 
-message VectorBatchAck {
+message PkVectorAck {
   bool ok = 1;
 }
