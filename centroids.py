@@ -7,20 +7,21 @@ import sys
 import psycopg2
 import numpy as np
 from tqdm import tqdm
-from sklearn.cluster import MiniBatchKMeans, DBSCAN
+# from sklearn.cluster import MiniBatchKMeans
 import multiprocessing
 import ast
 import time, random
 from psycopg2 import errors
 from psycopg2.extras import execute_values
-import atexit
-import joblib
+from psycopg2.pool import ThreadedConnectionPool
+# import atexit
+# import joblib
 from pathlib import Path
 from datetime import datetime, UTC
 import grpc
 from gen import kmeans_pb2 as pb2
 from gen import kmeans_pb2_grpc as pb2_grpc
-import pickle
+from concurrent.futures import ThreadPoolExecutor
 
 
 def get_latest_epoch(conn, table, verbose=False) -> int:
@@ -34,8 +35,7 @@ def get_latest_epoch(conn, table, verbose=False) -> int:
     return int(epoch or 0)
 
 
-def bucket_vector_pks(conn, table, pk, batch_size, verbose=False):
-    concurrency = os.environ["OMP_NUM_THREADS"]
+def bucket_vector_pks(conn, concurrency, table, pk, batch_size, verbose=False):
 
     sql = f"""
         WITH b AS (                                                                   
@@ -126,76 +126,7 @@ def fetch_vectors(
 
 
 
-def load_existing_centroids(conn, table, column, epoch, verbose=False):
-    centroids_table = f"{table}_{column}_centroid"
-    result = None
-    if verbose:
-        print(f"[INFO] Centroid epoch (passed): {epoch}")
-    if epoch:
-        sql_rows = f"SELECT id, centroid FROM {centroids_table} WHERE epoch = %s ORDER BY id"
-        if verbose:
-            print(sql_rows % (epoch,))
-        with conn.cursor() as cur:
-            cur.execute(sql_rows, (epoch,))
-            rows = cur.fetchall()
-        centroids = []
-        for _cid, c in rows:
-            if isinstance(c, list):
-                vec = c
-            elif isinstance(c, np.ndarray):
-                vec = c.tolist()
-            elif isinstance(c, str):
-                vec = json.loads(c)
-                if not isinstance(vec, list):
-                    raise ValueError("parsed centroid JSON is not a list")
-            else:
-                vec = list(c)
-            centroids.append(vec)
-        arr = np.array(centroids, dtype=np.float32)
-        if arr.size > 0:
-            result = arr
-    return result
 
-
-# --- file-based model persistence (minimal) ---
-
-def get_last_saved_model(dir_path, table, column):
-    p = Path(dir_path)
-    p.mkdir(parents=True, exist_ok=True)
-
-    files = sorted(p.glob(f"{table}_{column}.*.joblib"), key=lambda f: f.name, reverse=True)
-
-    return str(files[0]) if files else None
-
-
-def save_model(dir_path, table, column, model, compress=3):
-    p = Path(dir_path)
-    p.mkdir(parents=True, exist_ok=True)
-
-    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")
-    filename = f"{table}_{column}.{ts}.joblib"
-    model_path = p.joinpath(filename)
-
-    if compress:
-        joblib.dump(model, model_path, compress=compress)
-    else:
-        joblib.dump(model, model_path)
-
-    return str(model_path)
-
-
-def load_model(model_path, verbose=False):
-    """Load MiniBatchKMeans from file if present; else return None."""
-
-    model = None
-
-    if model_path and os.path.exists(model_path):
-        if verbose:
-            print(f"[INFO] Loading model from {model_path}")
-
-        model = joblib.load(model_path)
-
-    return model
 
 
 # --- transactional retry + batch persistence helpers ---
@@ -277,20 +208,11 @@ def persist_batch(conn, table, column, pks, labels, centroids, verbose=False, dr
 
 
 
-# def cluster_kmeans(model, vectors, verbose=False):
-#     model.partial_fit(vectors)
-#     labels = model.predict(vectors)
-
-#     if verbose:
-#         print(f"[INFO] Updated KMeans on batch of {vectors.shape[0]} rows")
-    
-#     return labels
-
 
 def run_kmeans_iteration(
                 conn,
-                model, table, pk, column,
-                pk_buckets,
+                table, pk, column,
+                bucket,
                 batch_size, verbose, dry_run, k
             ):
     """One full KMeans iteration: fetch → partial_fit → predict → save epoch + assignments."""
@@ -298,15 +220,14 @@ def run_kmeans_iteration(
     # 1) fetch one DB batch
     all_rows = []
 
-    for bucket in pk_buckets:
-        rows = fetch_vectors (
-                    conn, table, pk, column, bucket[1], bucket[2],
-                    batch_size=batch_size, verbose=verbose
-                )
-        # print(rows)
-        all_rows.extend(rows)
-        # # all_vectors = vectors if all_vectors is None else np.concatenate([all_vectors, vectors], axis=0)
-        # all_vectors.extend(vectors)
+    rows = fetch_vectors (
+                conn, table, pk, column, bucket[1], bucket[2],
+                batch_size=batch_size, verbose=verbose
+            )
+    # print(rows)
+    all_rows.extend(rows)
+    # # all_vectors = vectors if all_vectors is None else np.concatenate([all_vectors, vectors], axis=0)
+    # all_vectors.extend(vectors)
 
 
 
@@ -349,8 +270,6 @@ def run_kmeans_iteration(
         print(f"[INFO] Fetched {len(all_rows)} rows")
 
 
-    # future = stub.PutVectorBatch.future(batch)
-    # resp = future.resp()
     with grpc.insecure_channel("localhost:50051") as channel:
         def request_iter():
             for pk, vector in zip(pks, vectors):
@@ -364,16 +283,6 @@ def run_kmeans_iteration(
 
 
 
-    # TODO: This below functionality has been moved to the Kmeans Server
-    #
-    #
-    # # 3) single-batch update + labels
-    # labels = cluster_kmeans(model, all_vectors, verbose=verbose)
-    # centroids = model.cluster_centers_
-
-    # if verbose:
-    #     print(f"[INFO] Labels: {labels}")
-    #     print(f"[INFO] Centroids shape: {centroids.shape}")
 
     # # 4) persist in a single retriable txn
     # epoch = persist_batch(conn, table, column, all_pks, labels, centroids, verbose=verbose, dry_run=dry_run)
@@ -384,10 +293,6 @@ def run_kmeans_iteration(
     return None
 
 
-# def cluster_dbscan(vectors):
-#     model = DBSCAN()
-#     labels = model.fit_predict(vectors)
-#     return labels, None
 
 
 # --- main ---
@@ -415,59 +320,30 @@ def main():
     if args.batch_size < args.clusters:
         parser.error(f"--batch-size ({args.batch_size}) must be >= --clusters ({args.clusters}).")
 
-    conn = psycopg2.connect(args.url)
+    concurrency = str(len(os.sched_getaffinity(0)))
+
+    # conn = psycopg2.connect(args.url)
+    pool = ThreadedConnectionPool(1, concurrency, dsn=args.url)
+
 
     centroids_table = f"{args.table}_{args.input}_centroid"
+    conn = pool.getconn()
     epoch = get_latest_epoch(conn, centroids_table, verbose=args.verbose)
-
-    # if args.algorithm == "kmeans":
-
-    os.environ["OMP_NUM_THREADS"] = str(len(os.sched_getaffinity(0)))   # OpenMP (MiniBatchKMeans)
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"                            # keep BLAS single-threaded
-    os.environ["MKL_NUM_THREADS"] = "1"
-
-    if args.verbose:
-        print(f"[INFO] Utilizing {os.environ['OMP_NUM_THREADS']} CPU cores")
-
-    # Prefer file resume; else warm-start from latest DB centroids; else fresh
-    model_path = get_last_saved_model(args.model, args.table, args.input)
-    if args.verbose:
-        print(f"[INFO] Loading last saved mode from {model_path}")
-
-    model = None
-    model = load_model(model_path, verbose=args.verbose)
-    if args.verbose:
-        print(f"[INFO] Model: {model}")
-
-    # Save once on process exit
-    # register_save_on_exit(model_path, get_model=lambda: model, verbose=args.verbose)
-
-
-    if model is None:
-        initial = load_existing_centroids(
-                                conn,
-                                args.table, args.input,
-                                epoch=epoch,
-                                verbose=args.verbose
-                    )
-        model = MiniBatchKMeans(
-            n_clusters=args.clusters,
-            batch_size=args.batch_size,
-            random_state=42,
-            init=initial if initial is not None else 'k-means++',
-            n_init=1 if initial is not None else 10
-        )
+    pool.putconn(conn)
 
     remaining = args.num_batches
-
-    # TODO: This may need to go once the bucketing is implemented
-    first_pk = None
 
     # In order to build vector batched in parallel, we bucket the entire
     # {table}.{primary_key} value space into the number of buckets, where
     # number of buckets is a multiple of the number of CPU's available to
     # this process.
-    pk_buckets = bucket_vector_pks(conn, args.table, args.primary_key, args.batch_size, args.verbose)
+
+    if args.verbose:
+        print(f"[INFO] Splitting all un-associated vectors into {concurrency} buckets")
+
+    conn = pool.getconn()
+    pk_buckets = bucket_vector_pks(conn, concurrency, args.table, args.primary_key, args.batch_size, args.verbose)
+    pool.putconn(conn)
 
     while True:
         if remaining is not None and remaining <= 0:
@@ -475,37 +351,27 @@ def main():
                 print(f"[INFO] Reached requested iterations: {args.num_batches}")
             break
 
-        run_kmeans_iteration(
-            conn, 
-            model,
-            args.table,
-            args.primary_key,
-            args.input,
-            pk_buckets,
-            batch_size=args.batch_size,
-            verbose=args.verbose,
-            dry_run=args.dry_run,
-            k=args.clusters
-        )
+        for bucket in pk_buckets:
+            conn = pool.getconn()
+            run_kmeans_iteration(
+                conn,
+                args.table,
+                args.primary_key,
+                args.input,
+                bucket,
+                batch_size=args.batch_size,
+                verbose=args.verbose,
+                dry_run=args.dry_run,
+                k=args.clusters
+            )
+            pool.putconn(conn)
 
-        if args.verbose:
-            print(f"[INFO] First PK = '{first_pk}'")
-
-        if first_pk is None:
-            break
 
         if remaining is not None:
             remaining -= 1
 
 
-    # if args.verbose:
-    #     print(f"[INFO] Saving mode to {model_path}")
-    # model_path = save_model(args.model, args.table, args.input, model)
-
-    # else:
-    #     print("DBSCAN is not implemented yet...")
-
-    conn.close()
+    # pool.clear()
 
 
 if __name__ == "__main__":
