@@ -24,13 +24,6 @@ def run():
         [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
     ]
 
-    # batch = pb2.VectorBatch(
-    #     data = pickle.dumps((pks, vectors), protocol=pickle.HIGHEST_PROTOCOL)
-    # )
-    # print(batch)
-
-
-
 
     with grpc.insecure_channel("localhost:50051") as channel:
         def request_iter():

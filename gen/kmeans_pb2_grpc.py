@@ -3,6 +3,7 @@
 import grpc
 import warnings
 
+from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 import kmeans_pb2 as kmeans__pb2
 
 GRPC_GENERATED_VERSION = '1.75.1'
@@ -40,6 +41,11 @@ class KmeansStub(object):
                 request_serializer=kmeans__pb2.PkVector.SerializeToString,
                 response_deserializer=kmeans__pb2.PkVectorAck.FromString,
                 _registered_method=True)
+        self.GetPkCentroids = channel.unary_stream(
+                '/Kmeans.Kmeans/GetPkCentroids',
+                request_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
+                response_deserializer=kmeans__pb2.PkCentroids.FromString,
+                _registered_method=True)
 
 
 class KmeansServicer(object):
@@ -53,6 +59,13 @@ class KmeansServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetPkCentroids(self, request, context):
+        """Streams KMeans partial fits results out
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_KmeansServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -60,6 +73,11 @@ def add_KmeansServicer_to_server(servicer, server):
                     servicer.PutPkVector,
                     request_deserializer=kmeans__pb2.PkVector.FromString,
                     response_serializer=kmeans__pb2.PkVectorAck.SerializeToString,
+            ),
+            'GetPkCentroids': grpc.unary_stream_rpc_method_handler(
+                    servicer.GetPkCentroids,
+                    request_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
+                    response_serializer=kmeans__pb2.PkCentroids.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -90,6 +108,33 @@ class Kmeans(object):
             '/Kmeans.Kmeans/PutPkVector',
             kmeans__pb2.PkVector.SerializeToString,
             kmeans__pb2.PkVectorAck.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetPkCentroids(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/Kmeans.Kmeans/GetPkCentroids',
+            google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
+            kmeans__pb2.PkCentroids.FromString,
             options,
             channel_credentials,
             insecure,

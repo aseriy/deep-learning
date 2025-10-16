@@ -8,6 +8,7 @@ from asyncio.queues import QueueShutDown
 import grpc
 from gen import kmeans_pb2 as pb2
 from gen import kmeans_pb2_grpc as pb2_grpc
+from google.protobuf import empty_pb2
 import numpy as np
 from sklearn.cluster import MiniBatchKMeans
 import joblib
@@ -15,25 +16,6 @@ from pathlib import Path
 from datetime import datetime, UTC
 import psycopg2
 import time
-# import atexit
-# import threading
-# import pickle
-
-
-
-# def cluster_kmeans(model, vectors, verbose=False):
-#     model.partial_fit(vectors)
-#     labels = model.predict(vectors)
-#     centroids = model.cluster_centers_
-
-#     return labels, centroids
-
-
-
-#     # # 4) persist in a single retriable txn
-#     # epoch = persist_batch(conn, table, column, all_pks, labels, centroids, verbose=verbose, dry_run=dry_run)
-#     # if verbose:
-#     #     print(f"[INFO] Completed iteration (epoch={epoch})")
 
 
 def worker_kmeans(conn, model, verbose=False):
@@ -94,8 +76,8 @@ async def worker(name, queue_in, queue_out, parent_conn, batch_size, verbose=Fal
         while True:
             try:
                 pk, vector = await queue_in.get()
-                if verbose:
-                    print(f"[INFO] Retrieved {pk} from the queue...")
+                # if verbose:
+                #     print(f"[INFO] Retrieved {pk} from the queue...")
 
             except QueueShutDown:
                 if verbose:
@@ -109,8 +91,8 @@ async def worker(name, queue_in, queue_out, parent_conn, batch_size, verbose=Fal
                 queue_in.task_done()
                 pks.append(pk)
                 vectors.append(list(vector))
-                if verbose:
-                    print(f"[INFO] Received {len(pks)} vectors, {queue_in.qsize()} messages still in the queue...")
+                # if verbose:
+                #     print(f"[INFO] Received {len(pks)} vectors, {queue_in.qsize()} messages still in the queue...")
 
                 if len(pks) == batch_size:
                     if verbose:
@@ -125,7 +107,7 @@ async def worker(name, queue_in, queue_out, parent_conn, batch_size, verbose=Fal
                         print(f"[INFO] Centroids: {centroids}")
 
                     # Add the results to the output queue
-                    await queue_out.put((labels, centroids))
+                    await queue_out.put((pks, labels, centroids))
 
 
                     # Empty the buffers
@@ -146,6 +128,7 @@ async def worker(name, queue_in, queue_out, parent_conn, batch_size, verbose=Fal
 
 class KmeansService(pb2_grpc.KmeansServicer):
     def __init__(self, parent_conn, batch_size, verbose=False):
+        self.verbose = verbose
         self.vectors_in_queue = asyncio.Queue()
         self.labels_out_queue = asyncio.Queue()
         
@@ -179,8 +162,6 @@ class KmeansService(pb2_grpc.KmeansServicer):
         # await self.labels_out_queue.join()
 
 
-
-
     async def PutPkVector(self, request_iterator, context):
         # do non-blocking work here (or offload CPU work; see note below)
 
@@ -192,6 +173,29 @@ class KmeansService(pb2_grpc.KmeansServicer):
             await self.vectors_in_queue.put((req.pk, req.vector))
 
         return pb2.PkVectorAck(ok=True)
+
+
+    async def GetPkCentroids(self, request, context):
+        print(f"[INFO] Streaming....")
+        while True:
+            pks, labels, centroids = await self.labels_out_queue.get()
+            data = pb2.PkCentroids()
+            
+            try:
+                data.pks.extend(pks)
+                data.labels.extend(np.asarray(labels.astype(int, copy=False).tolist()))
+                for centroid in np.asarray(centroids, dtype=np.float32):
+                    c = data.centroids.add()
+                    c.feature.extend(centroid.tolist())
+
+                # print(f"[INFO] Streaming: {data}")
+                yield data
+
+            except Exception as e:
+                print(e)
+
+            finally:
+                self.labels_out_queue.task_done()
 
 
 

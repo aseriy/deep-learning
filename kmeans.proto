@@ -2,10 +2,15 @@ syntax = "proto3";
 
 package Kmeans;
 
+import "google/protobuf/empty.proto";
+
 // The Kmeans service definition.
 service Kmeans {
   // Receives a batch of vectors for clustering.
   rpc PutPkVector (stream PkVector) returns (PkVectorAck);
+
+  // Streams KMeans partial fits results out
+  rpc GetPkCentroids (google.protobuf.Empty) returns (stream PkCentroids);
 }
 
 // Messages
@@ -16,4 +21,15 @@ message PkVector {
 
 message PkVectorAck {
   bool ok = 1;
+}
+
+message PkCentroids {
+  repeated string pks = 1;
+  repeated int32 labels =2;
+
+  message Centroid {
+    repeated float feature = 1;
+  }
+
+  repeated Centroid centroids = 3;
 }

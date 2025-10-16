@@ -7,21 +7,73 @@ import sys
 import psycopg2
 import numpy as np
 from tqdm import tqdm
-# from sklearn.cluster import MiniBatchKMeans
-import multiprocessing
+import multiprocessing as mp
+import signal
 import ast
 import time, random
 from psycopg2 import errors
 from psycopg2.extras import execute_values
 from psycopg2.pool import ThreadedConnectionPool
-# import atexit
-# import joblib
 from pathlib import Path
 from datetime import datetime, UTC
 import grpc
 from gen import kmeans_pb2 as pb2
 from gen import kmeans_pb2_grpc as pb2_grpc
+from google.protobuf import empty_pb2
 from concurrent.futures import ThreadPoolExecutor
+
+
+
+
+def worker_cluster_assigner(parent_conn, url, table, column, verbose=False):
+    concurrency = str(len(os.sched_getaffinity(0)))
+
+    pool = ThreadedConnectionPool(1, concurrency, dsn=url)
+
+    if verbose:
+        print(f"[INFO] Starting cluster assigner worker")
+
+    # Close over 'parent_conn' so handlers can safely unblock recv()
+    def _shutdown_handler(signum, frame):
+        if verbose:
+            print(f"[INFO] Shutting down cluster assigner worker")
+
+        try:
+            conn.close()  # unblocks conn.recv() with EOFError/OSError
+        except Exception:
+            pass  # already closed or race
+
+    # Trap SIGTERM (prod) and SIGINT (local Ctrl-C) for a quiet exit
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT,  _shutdown_handler)
+
+    conn = pool.getconn()
+    with grpc.insecure_channel("localhost:50051") as channel:
+        stub = pb2_grpc.KmeansStub(channel)
+        stream = stub.GetPkCentroids(empty_pb2.Empty(), wait_for_ready=True, timeout=None)
+        for batch in stream:
+            pks = list(batch.pks)
+            labels = list(batch.labels)
+            centroids = [list(c.feature) for c in batch.centroids]
+            if verbose:
+                print(f"[INFO] PKs: {pks}")
+                print(f"[INFO] Labels: {labels}")
+                print(f"[INFO] Centroids: {centroids}")
+
+            # # 4) persist in a single retriable txn
+            conn = pool.getconn()
+            epoch = persist_batch(
+                        conn,
+                        table, column, 
+                        pks, labels, centroids,
+                        verbose=verbose
+                    )
+            if verbose:
+                print(f"[INFO] Completed iteration (epoch={epoch})")
+            pool.putconn(conn)
+
+
+
 
 
 def get_latest_epoch(conn, table, verbose=False) -> int:
@@ -94,34 +146,8 @@ def fetch_vectors(
     rows = None
     with conn.cursor() as cur:
         cur.execute(sql, (pk_start,pk_end))
-        rows = cur.fetchall()        
+        rows = cur.fetchall()
 
-    # Shuffle client-side to remove pid-order bias
-    # Use numpy RNG for reproducibility
-    # rng = np.random.default_rng()
-    # rng.shuffle(rows)  # in-place
-    # rows = rows[:batch_size]
-
-    # pks, vectors = [], []
-    # for pk_value, v in rows:
-    #     try:
-    #         if isinstance(v, list):
-    #             vec = v
-    #         elif isinstance(v, np.ndarray):
-    #             vec = v.tolist()
-    #         elif isinstance(v, str):
-    #             vec = json.loads(v)
-    #             if not isinstance(vec, list):
-    #                 raise ValueError("parsed JSON is not a list")
-    #         else:
-    #             vec = list(v)
-    #         pks.append(pk_value)
-    #         vectors.append(vec)
-    #     except Exception as e:
-    #         if verbose:
-    #             print(f"[WARN] Skipping row {pk_value}: {e}")
-
-    # return pks, np.array(vectors, dtype=np.float32)
     return rows
 
 
@@ -217,21 +243,12 @@ def run_kmeans_iteration(
             ):
     """One full KMeans iteration: fetch → partial_fit → predict → save epoch + assignments."""
     
-    # 1) fetch one DB batch
-    all_rows = []
-
     rows = fetch_vectors (
                 conn, table, pk, column, bucket[1], bucket[2],
                 batch_size=batch_size, verbose=verbose
             )
-    # print(rows)
-    all_rows.extend(rows)
-    # # all_vectors = vectors if all_vectors is None else np.concatenate([all_vectors, vectors], axis=0)
-    # all_vectors.extend(vectors)
 
-
-
-    if len(all_rows) == 0:
+    if len(rows) == 0:
         if verbose:
             print("[INFO] No more vectors to process.")
         return None
@@ -239,13 +256,10 @@ def run_kmeans_iteration(
     # Shuffle client-side to remove pid-order bias
     # Use numpy RNG for reproducibility
     rng = np.random.default_rng()
-    rng.shuffle(all_rows)  # in-place
-    # all_rows = all_rows[:batch_size]
-
-
+    rng.shuffle(rows)  # in-place
 
     pks, vectors = [], []
-    for pk_value, v in all_rows:
+    for pk_value, v in rows:
         try:
             if isinstance(v, list):
                 vec = v
@@ -265,30 +279,17 @@ def run_kmeans_iteration(
             if verbose:
                 print(f"[WARN] Skipping row {pk_value}: {e}")
 
-
     if verbose:
-        print(f"[INFO] Fetched {len(all_rows)} rows")
-
+        print(f"[INFO] Fetched {len(rows)} rows")
 
     with grpc.insecure_channel("localhost:50051") as channel:
         def request_iter():
             for pk, vector in zip(pks, vectors):
-                # print(pk)
-                # print(vector)
                 yield pb2.PkVector(pk=pk, vector=vector)
 
         stub = pb2_grpc.KmeansStub(channel)
         resp = stub.PutPkVector(request_iter(), timeout=60)
         print(resp)
-
-
-
-
-    # # 4) persist in a single retriable txn
-    # epoch = persist_batch(conn, table, column, all_pks, labels, centroids, verbose=verbose, dry_run=dry_run)
-
-    # if verbose:
-    #     print(f"[INFO] Completed iteration (epoch={epoch})")
 
     return None
 
@@ -305,7 +306,7 @@ def main():
     parser.add_argument("-i", "--input", required=True, help="Column containing vector embeddings")
     # parser.add_argument("-a", "--algorithm", choices=["kmeans", "dbscan"], default="kmeans", help="Clustering algorithm to use")
     parser.add_argument("-c", "--clusters", type=int, default=8, help="Number of clusters (only for KMeans)")
-    parser.add_argument("-w", "--workers", type=int, default=multiprocessing.cpu_count(), help="Number of parallel workers (not yet used)")
+    parser.add_argument("-w", "--workers", type=int, default=mp.cpu_count(), help="Number of parallel workers (not yet used)")
     parser.add_argument("-b", "--batch-size", type=int, default=1000, help="Batch size for processing rows")
     parser.add_argument("-n", "--num-batches", type=int, default=None, help="Limit number of batches to process (default: all)")
 
@@ -321,6 +322,17 @@ def main():
         parser.error(f"--batch-size ({args.batch_size}) must be >= --clusters ({args.clusters}).")
 
     concurrency = str(len(os.sched_getaffinity(0)))
+
+    # Fork a separate child process to receive the Kmeans results
+    # and update the vector-to-centroid mapping.
+    # This process will create its own DB connection pool.
+    mp.set_start_method("forkserver")
+    parent_conn, child_conn = mp.Pipe(duplex=True)
+    p = mp.Process(target=worker_cluster_assigner, args=(child_conn, args.url, args.table, args. input, args.verbose))
+    p.start()
+    # close child's end in parent
+    child_conn.close()              
+
 
     # conn = psycopg2.connect(args.url)
     pool = ThreadedConnectionPool(1, concurrency, dsn=args.url)
@@ -371,8 +383,7 @@ def main():
             remaining -= 1
 
 
-    # pool.clear()
-
+    p.join()
 
 if __name__ == "__main__":
     main()

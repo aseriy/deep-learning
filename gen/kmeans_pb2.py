@@ -22,19 +22,24 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
+from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0ckmeans.proto\x12\x06Kmeans\"&\n\x08PkVector\x12\n\n\x02pk\x18\x01 \x01(\t\x12\x0e\n\x06vector\x18\x02 \x03(\x02\"\x19\n\x0bPkVectorAck\x12\n\n\x02ok\x18\x01 \x01(\x08\x32@\n\x06Kmeans\x12\x36\n\x0bPutPkVector\x12\x10.Kmeans.PkVector\x1a\x13.Kmeans.PkVectorAck(\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0ckmeans.proto\x12\x06Kmeans\x1a\x1bgoogle/protobuf/empty.proto\"&\n\x08PkVector\x12\n\n\x02pk\x18\x01 \x01(\t\x12\x0e\n\x06vector\x18\x02 \x03(\x02\"\x19\n\x0bPkVectorAck\x12\n\n\x02ok\x18\x01 \x01(\x08\"x\n\x0bPkCentroids\x12\x0b\n\x03pks\x18\x01 \x03(\t\x12\x0e\n\x06labels\x18\x02 \x03(\x05\x12/\n\tcentroids\x18\x03 \x03(\x0b\x32\x1c.Kmeans.PkCentroids.Centroid\x1a\x1b\n\x08\x43\x65ntroid\x12\x0f\n\x07\x66\x65\x61ture\x18\x01 \x03(\x02\x32\x81\x01\n\x06Kmeans\x12\x36\n\x0bPutPkVector\x12\x10.Kmeans.PkVector\x1a\x13.Kmeans.PkVectorAck(\x01\x12?\n\x0eGetPkCentroids\x12\x16.google.protobuf.Empty\x1a\x13.Kmeans.PkCentroids0\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'kmeans_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_PKVECTOR']._serialized_start=24
-  _globals['_PKVECTOR']._serialized_end=62
-  _globals['_PKVECTORACK']._serialized_start=64
-  _globals['_PKVECTORACK']._serialized_end=89
-  _globals['_KMEANS']._serialized_start=91
-  _globals['_KMEANS']._serialized_end=155
+  _globals['_PKVECTOR']._serialized_start=53
+  _globals['_PKVECTOR']._serialized_end=91
+  _globals['_PKVECTORACK']._serialized_start=93
+  _globals['_PKVECTORACK']._serialized_end=118
+  _globals['_PKCENTROIDS']._serialized_start=120
+  _globals['_PKCENTROIDS']._serialized_end=240
+  _globals['_PKCENTROIDS_CENTROID']._serialized_start=213
+  _globals['_PKCENTROIDS_CENTROID']._serialized_end=240
+  _globals['_KMEANS']._serialized_start=243
+  _globals['_KMEANS']._serialized_end=372
 # @@protoc_insertion_point(module_scope)
