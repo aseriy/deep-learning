@@ -26,9 +26,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 
 def worker_cluster_assigner(parent_conn, url, table, column, verbose=False):
-    concurrency = str(len(os.sched_getaffinity(0)))
+    concurrency = len(os.sched_getaffinity(0))
 
-    pool = ThreadedConnectionPool(1, concurrency, dsn=url)
+    pool = ThreadedConnectionPool(concurrency, 3*concurrency, dsn=url)
+    stream = None
 
     if verbose:
         print(f"[INFO] Starting cluster assigner worker")
@@ -39,39 +40,62 @@ def worker_cluster_assigner(parent_conn, url, table, column, verbose=False):
             print(f"[INFO] Shutting down cluster assigner worker")
 
         try:
-            conn.close()  # unblocks conn.recv() with EOFError/OSError
+            stream is None or stream.cancel()
+            parent_conn.close()  # unblocks parent_conn.recv() with EOFError/OSError
+        
         except Exception:
             pass  # already closed or race
+
 
     # Trap SIGTERM (prod) and SIGINT (local Ctrl-C) for a quiet exit
     signal.signal(signal.SIGTERM, _shutdown_handler)
     signal.signal(signal.SIGINT,  _shutdown_handler)
 
-    conn = pool.getconn()
-    with grpc.insecure_channel("localhost:50051") as channel:
-        stub = pb2_grpc.KmeansStub(channel)
-        stream = stub.GetPkCentroids(empty_pb2.Empty(), wait_for_ready=True, timeout=None)
-        for batch in stream:
-            pks = list(batch.pks)
-            labels = list(batch.labels)
-            centroids = [list(c.feature) for c in batch.centroids]
-            if verbose:
-                print(f"[INFO] PKs: {pks}")
-                print(f"[INFO] Labels: {labels}")
-                print(f"[INFO] Centroids: {centroids}")
+    try:
+        with grpc.insecure_channel("localhost:50051") as channel:
+            stub = pb2_grpc.KmeansStub(channel)
+            stream = stub.GetPkCentroids(empty_pb2.Empty(), wait_for_ready=True, timeout=None)
+            for batch in stream:
+                pks = list(batch.pks)
+                labels = list(batch.labels)
+                centroids = [list(c.feature) for c in batch.centroids]
+                if verbose:
+                    print(f"[INFO] PKs: {pks}")
+                    print(f"[INFO] Labels: {labels}")
+                    print(f"[INFO] Centroids: {centroids}")
 
-            # # 4) persist in a single retriable txn
-            conn = pool.getconn()
-            epoch = persist_batch(
-                        conn,
-                        table, column, 
-                        pks, labels, centroids,
-                        verbose=verbose
-                    )
-            if verbose:
-                print(f"[INFO] Completed iteration (epoch={epoch})")
-            pool.putconn(conn)
+                # # 4) persist in a single retriable txn
+                conn = pool.getconn()
+                epoch = persist_batch(
+                            conn,
+                            table, column, 
+                            pks, labels, centroids,
+                            verbose=verbose
+                        )
+                if verbose:
+                    print(f"[INFO] Completed iteration (epoch={epoch})")
+                pool.putconn(conn)
 
+
+            if verbose:
+                if stream.code() == grpc.StatusCode.OK:
+                    print(f"[INFO] gRPC closed stream normally: {stream.code()}")
+                else:
+                    print(f"[INFO] gRPC closed stream with error: {stream.details()}")
+
+    except grpc.RpcError as e:
+        if e.code() == grpc.StatusCode.CANCELLED:
+            if verbose:
+                print(f'[INFO] Cluster assigner worker exiting...')
+
+            # TODO: We're handling SIGTERM here. By default exists with SIGTERM (-15)
+            #       If a different exit code is desired, un-comment and exist with a
+            #       desired code.
+            sys.exit(130)
+
+    finally:
+        # Clean up before exiting...
+        pool.closeall()
 
 
 
@@ -288,10 +312,18 @@ def run_kmeans_iteration(
                 yield pb2.PkVector(pk=pk, vector=vector)
 
         stub = pb2_grpc.KmeansStub(channel)
-        resp = stub.PutPkVector(request_iter(), timeout=60)
-        print(resp)
 
-    return None
+        resp = None
+        try:
+            resp = stub.PutPkVector(request_iter(), timeout=60)
+            print(resp)
+
+        except grpc.RpcError:
+            if verbose:
+                print(f"[INFO] gRPC server closed connection.")
+            pass
+
+    return False if resp is None else True
 
 
 
@@ -299,7 +331,7 @@ def run_kmeans_iteration(
 # --- main ---
 
 def main():
-    parser = argparse.ArgumentParser(description="Cluster vector column from CockroachDB using KMeans or DBSCAN.")
+    parser = argparse.ArgumentParser(description="Cluster vector column from CockroachDB using KMeans")
     parser.add_argument("-u", "--url", required=True, help="CockroachDB connection URL")
     parser.add_argument("-t", "--table", required=True, help="Table name containing vectors")
     parser.add_argument("-p", "--primary-key", required=True, help="Primary key of the table name containing vectors")
@@ -321,29 +353,60 @@ def main():
     if args.batch_size < args.clusters:
         parser.error(f"--batch-size ({args.batch_size}) must be >= --clusters ({args.clusters}).")
 
-    concurrency = str(len(os.sched_getaffinity(0)))
+    concurrency = len(os.sched_getaffinity(0))
 
     # Fork a separate child process to receive the Kmeans results
     # and update the vector-to-centroid mapping.
     # This process will create its own DB connection pool.
     mp.set_start_method("forkserver")
     parent_conn, child_conn = mp.Pipe(duplex=True)
-    p = mp.Process(target=worker_cluster_assigner, args=(child_conn, args.url, args.table, args. input, args.verbose))
+    p = mp.Process(target=worker_cluster_assigner, args=(child_conn, args.url, args.table, args.input, args.verbose))
     p.start()
     # close child's end in parent
     child_conn.close()              
 
 
-    # conn = psycopg2.connect(args.url)
-    pool = ThreadedConnectionPool(1, concurrency, dsn=args.url)
+    pool = ThreadedConnectionPool(concurrency, 3*concurrency, dsn=args.url)
+    remaining = args.num_batches
+    shutting_down = False
+
+    # BEGIN graceful shutdown setup
+
+    def _shutdown_handler(signum, frame):
+        nonlocal shutting_down, remaining
+
+        if args.verbose:
+            print(f"[INFO] Shutting down {__file__}")
+
+        try:
+            # Flag to run_kmeans_iteration() to fold
+            remaining = None
+
+            # If we're still in the process of shutting down gracefully
+            if not shutting_down:
+                shutting_down = True
+                # Tell the child process to fold and wait for it to exit
+                p.terminate()
+                while p.is_alive(): p.join(timeout=0.5)
+            else:
+                p.kill()
+                sys.exit(130)
+ 
+        except Exception:
+            pass  # already closed or race
+
+    # Trap SIGTERM (prod) and SIGINT (local Ctrl-C) for a quiet exit
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT,  _shutdown_handler)
+
+    # END OF graceful shutdown setup
+
 
 
     centroids_table = f"{args.table}_{args.input}_centroid"
     conn = pool.getconn()
     epoch = get_latest_epoch(conn, centroids_table, verbose=args.verbose)
     pool.putconn(conn)
-
-    remaining = args.num_batches
 
     # In order to build vector batched in parallel, we bucket the entire
     # {table}.{primary_key} value space into the number of buckets, where
@@ -365,7 +428,7 @@ def main():
 
         for bucket in pk_buckets:
             conn = pool.getconn()
-            run_kmeans_iteration(
+            success = run_kmeans_iteration(
                 conn,
                 args.table,
                 args.primary_key,
@@ -377,6 +440,10 @@ def main():
                 k=args.clusters
             )
             pool.putconn(conn)
+            
+            if not success:
+                remaining = 0
+                break
 
 
         if remaining is not None:
@@ -384,6 +451,11 @@ def main():
 
 
     p.join()
+    # TODO: The above line waits for the child process running worker_cluster_assigner() to exit.
+    #       If any logic around the child exit code is required, un-comment below and implement.
+    # p.exitcode
+
+    pool.closeall()
 
 if __name__ == "__main__":
     main()
