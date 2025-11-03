@@ -54,10 +54,10 @@ def worker_cluster_assigner(parent_conn, url, table, column, verbose=False):
                 pks = list(batch.pks)
                 labels = list(batch.labels)
                 centroids = [list(c.feature) for c in batch.centroids]
-                if verbose:
-                    print(f"[INFO] PKs: {pks}")
-                    print(f"[INFO] Labels: {labels}")
-                    print(f"[INFO] Centroids: {centroids}")
+                # if verbose:
+                #     print(f"[INFO] PKs: {pks}")
+                #     print(f"[INFO] Labels: {labels}")
+                #     print(f"[INFO] Centroids: {centroids}")
 
                 # persist in a single retriable txn
                 conn = pool.getconn()
@@ -107,13 +107,16 @@ def get_latest_epoch(conn, table, verbose=False) -> int:
     return int(epoch or 0)
 
 
-def bucket_vector_pks(conn, concurrency, table, pk, batch_size, verbose=False):
+def bucket_vector_pks(conn, concurrency, table, pk, watermark, batch_size, verbose=False):
+    predicate = f"WHERE {pk} > %s" if watermark is not None else ""
+
 
     sql = f"""
         WITH b AS (                                                                   
             SELECT {pk}, NTILE({concurrency}) OVER (ORDER BY {pk}) AS bucket                         
-            FROM {table}                                                                
-        )                                                                             
+            FROM {table}
+            {predicate}
+        )
         SELECT
             bucket,
             MIN({pk}) AS start_pk,
@@ -125,11 +128,18 @@ def bucket_vector_pks(conn, concurrency, table, pk, batch_size, verbose=False):
     """
 
     if verbose:
-        print(f"[INFO] {sql}")
+        if watermark is not None:
+            print("[INFO]", sql % (f"'{watermark}'",))
+        else:
+            print("[INFO]", sql)
 
     buckets = None
     with conn.cursor() as cur:
-        cur.execute(sql)
+        if watermark is not None:
+            cur.execute(sql, (watermark,))
+        else:
+            cur.execute(sql)
+
         buckets = cur.fetchall()
 
     # print(json.dumps(rows, indent=2))
@@ -161,7 +171,7 @@ def fetch_vectors(
         """
 
     if verbose:
-        print("[INFO] ", sql % (f"'{pk_start}'", f"'{pk_end}"))
+        print("[INFO] ", sql % (f"'{pk_start}'", f"'{pk_end}'"))
 
     rows = None
     with conn.cursor() as cur:
@@ -169,9 +179,6 @@ def fetch_vectors(
         rows = cur.fetchall()
 
     return rows
-
-
-
 
 
 
@@ -215,7 +222,12 @@ def persist_batch(conn, table, column, pks, labels, centroids, verbose=False):
 
     def _txn(cur):
         # 1) epoch
-        cur.execute("SELECT nextval(%s)", (seq_name,))
+        sql = f"SELECT nextval(%s)"
+
+        if verbose:
+            print(f"[INFO] {sql % (f"'{seq_name}'",)}")
+
+        cur.execute(sql, (seq_name,))
         (epoch,) = cur.fetchone()
         if verbose:
             print(f"[INFO] Using epoch {epoch}")
@@ -225,8 +237,17 @@ def persist_batch(conn, table, column, pks, labels, centroids, verbose=False):
         for i, c in enumerate(centroids):
             vec = c.tolist() if isinstance(c, np.ndarray) else (c if isinstance(c, list) else list(c))
             centroid_rows.append((epoch, i, vec))
+
         if centroid_rows:
-            sql_cent = f"UPSERT INTO {centroids_table} (epoch, id, centroid) VALUES %s"
+            sql_cent = f"""
+                UPSERT INTO {centroids_table} (epoch, id, centroid)
+                VALUES
+                %s
+            """
+
+            if verbose:
+                print(f"[INFO] {sql_cent % ',\n'.join(map(str, centroid_rows[:2]))}")
+
             execute_values(cur, sql_cent, centroid_rows)
             if verbose:
                 print(f"[INFO] Upserted {len(centroid_rows)} centroids")
@@ -234,7 +255,15 @@ def persist_batch(conn, table, column, pks, labels, centroids, verbose=False):
         # 3) assignments
         assign_rows = [(pk, epoch, int(label)) for pk, label in zip(pks, labels)]
         if assign_rows:
-            sql_assign = f"UPSERT INTO {clusters_table} (pid, epoch, cluster_id) VALUES %s"
+            sql_assign = f"""
+                UPSERT INTO {clusters_table} (pid, epoch, cluster_id)
+                VALUES
+                %s
+            """
+
+            if verbose:
+                print(f"[INFO] {sql_assign % ',\n'.join(map(str, assign_rows[:2]))}")
+
             execute_values(cur, sql_assign, assign_rows)
             if verbose:
                 print(f"[INFO] Upserted {len(assign_rows)} assignments")
@@ -294,6 +323,11 @@ def run_kmeans_iteration(
     if verbose:
         print(f"[INFO] Fetched {len(rows)} rows")
 
+    # If parsing the returned rows yields nothing,
+    # then return here with None
+    if len(pks) < 1:
+        return None
+
     with grpc.insecure_channel("localhost:50051") as channel:
         def request_iter():
             for pk, vector in zip(pks, vectors):
@@ -304,14 +338,14 @@ def run_kmeans_iteration(
         resp = None
         try:
             resp = stub.PutPkVector(request_iter(), timeout=60)
-            print(resp)
+            # print(resp)
 
         except grpc.RpcError:
             if verbose:
                 print(f"[INFO] gRPC server closed connection.")
-            pass
+            raise
 
-    return False if resp is None else True
+    return None if resp is None else max(pks)
 
 
 
@@ -416,6 +450,8 @@ def main():
     #                     Once completed, subtract from remaining and continue.
     #                     When remaining == 0, set shutting_down to True.
 
+    bucketing_watermark = None
+
     while not shutting_down:
         if remaining is not None and remaining < 1:
             if args.verbose:
@@ -423,34 +459,47 @@ def main():
             shutting_down = True
             break
 
-
         if args.verbose:
             print(f"[INFO] Splitting all un-associated vectors into {concurrency} buckets")
 
         conn = pool.getconn()
-        pk_buckets = bucket_vector_pks(conn, concurrency, args.table, args.primary_key, args.batch_size, args.verbose)
+        pk_buckets = bucket_vector_pks(
+                conn, concurrency,
+                args.table, args.primary_key, bucketing_watermark,
+                args.batch_size, args.verbose
+            )
         pool.putconn(conn)
 
+        bucket_maxes = []
         for bucket in pk_buckets:
             conn = pool.getconn()
-            success = run_kmeans_iteration(
-                conn,
-                args.table,
-                args.primary_key,
-                args.input,
-                bucket,
-                batch_size=args.batch_size,
-                verbose=args.verbose,
-                k=args.clusters
-            )
-            pool.putconn(conn)
-            
-            if not success:
+
+            try:
+                success = run_kmeans_iteration(
+                    conn,
+                    args.table,
+                    args.primary_key,
+                    args.input,
+                    bucket,
+                    batch_size=args.batch_size,
+                    verbose=args.verbose,
+                    k=args.clusters
+                )
+            except grpc.RpcError as e:
                 shutting_down = True
+
+            pool.putconn(conn)
+            if shutting_down:
                 break
+
+            if success is not None:
+                bucket_maxes.append(success)
 
         if remaining is not None:
             remaining -= 1
+
+        # Set the new watermark
+        bucketing_watermark = min(bucket_maxes)
 
 
     # At this point, we're not feeding any new vectors to the gRPC server.
