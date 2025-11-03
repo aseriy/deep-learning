@@ -4,12 +4,9 @@ import argparse
 import json
 import os
 import sys
-import psycopg2
 import numpy as np
-from tqdm import tqdm
 import multiprocessing as mp
 import signal
-import ast
 import time, random
 from psycopg2 import errors
 from psycopg2.extras import execute_values
@@ -27,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 def worker_cluster_assigner(parent_conn, url, table, column, verbose=False):
     concurrency = len(os.sched_getaffinity(0))
-
+    
     pool = ThreadedConnectionPool(concurrency, 3*concurrency, dsn=url)
     stream = None
 
@@ -37,12 +34,10 @@ def worker_cluster_assigner(parent_conn, url, table, column, verbose=False):
     # Close over 'parent_conn' so handlers can safely unblock recv()
     def _shutdown_handler(signum, frame):
         if verbose:
-            print(f"[INFO] Shutting down cluster assigner worker")
+            print(f"[INFO] Cluster assigner worker draining...")
 
         try:
             stream is None or stream.cancel()
-            parent_conn.close()  # unblocks parent_conn.recv() with EOFError/OSError
-        
         except Exception:
             pass  # already closed or race
 
@@ -64,11 +59,11 @@ def worker_cluster_assigner(parent_conn, url, table, column, verbose=False):
                     print(f"[INFO] Labels: {labels}")
                     print(f"[INFO] Centroids: {centroids}")
 
-                # # 4) persist in a single retriable txn
+                # persist in a single retriable txn
                 conn = pool.getconn()
                 epoch = persist_batch(
                             conn,
-                            table, column, 
+                            table, column,
                             pks, labels, centroids,
                             verbose=verbose
                         )
@@ -82,6 +77,7 @@ def worker_cluster_assigner(parent_conn, url, table, column, verbose=False):
                     print(f"[INFO] gRPC closed stream normally: {stream.code()}")
                 else:
                     print(f"[INFO] gRPC closed stream with error: {stream.details()}")
+
 
     except grpc.RpcError as e:
         if e.code() == grpc.StatusCode.CANCELLED:
@@ -204,7 +200,7 @@ def run_txn_with_retry(conn, fn, max_retries=8, base_sleep=0.05, jitter=0.05):
             raise
 
 
-def persist_batch(conn, table, column, pks, labels, centroids, verbose=False, dry_run=False):
+def persist_batch(conn, table, column, pks, labels, centroids, verbose=False):
     """
     Atomically:
       - allocate fresh epoch
@@ -216,14 +212,6 @@ def persist_batch(conn, table, column, pks, labels, centroids, verbose=False, dr
     centroids_table = f"{table}_{column}_centroid"
     clusters_table  = f"{table}_{column}_clusters"
     seq_name        = f"{table}_{column}_centroid_seq"
-
-    if dry_run:
-        simulated_epoch = -1
-        if verbose:
-            print(f"[DRY RUN] Would select nextval('{seq_name}') → epoch X")
-            print(f"[DRY RUN] Would UPSERT {len(centroids)} centroids into {centroids_table}")
-            print(f"[DRY RUN] Would UPSERT {len(pks)} assignments into {clusters_table}")
-        return simulated_epoch
 
     def _txn(cur):
         # 1) epoch
@@ -263,7 +251,7 @@ def run_kmeans_iteration(
                 conn,
                 table, pk, column,
                 bucket,
-                batch_size, verbose, dry_run, k
+                batch_size, verbose, k
             ):
     """One full KMeans iteration: fetch → partial_fit → predict → save epoch + assignments."""
     
@@ -336,16 +324,16 @@ def main():
     parser.add_argument("-t", "--table", required=True, help="Table name containing vectors")
     parser.add_argument("-p", "--primary-key", required=True, help="Primary key of the table name containing vectors")
     parser.add_argument("-i", "--input", required=True, help="Column containing vector embeddings")
-    # parser.add_argument("-a", "--algorithm", choices=["kmeans", "dbscan"], default="kmeans", help="Clustering algorithm to use")
     parser.add_argument("-c", "--clusters", type=int, default=8, help="Number of clusters (only for KMeans)")
+
+    # TODO: this option isn't being used at this time.
+    #       In the future, may be used a the CPU multiplier. Right now, the number of threads is based on the number of
+    #       available CPU's.
     parser.add_argument("-w", "--workers", type=int, default=mp.cpu_count(), help="Number of parallel workers (not yet used)")
+    
     parser.add_argument("-b", "--batch-size", type=int, default=1000, help="Batch size for processing rows")
     parser.add_argument("-n", "--num-batches", type=int, default=None, help="Limit number of batches to process (default: all)")
-
-    group = parser.add_argument_group()
-    group.add_argument("-v", "--verbose", action="store_true", help="Verbose output (used for debugging)")
-    group.add_argument("--progress", action="store_true", help="Show progress bar")
-    parser.add_argument("-d", "--dry-run", action="store_true", help="Dry run mode")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output (used for debugging)")
     parser.add_argument("-m", "--model", default="model", help="Path to directory to persist KMeans model")
 
     args = parser.parse_args()
@@ -371,6 +359,11 @@ def main():
     shutting_down = False
 
     # BEGIN graceful shutdown setup
+    # 1. Stop fetching vectors and feeding to the gRPC server.
+    # 2. Tell the worker_cluster_assigner() to procecc until nothing else is coming
+    #    from the server. Then exit.
+    # 3. Wait for the child process to exit for X secs. If the child hasn't existed by then,
+    #.   kill it.
 
     def _shutdown_handler(signum, frame):
         nonlocal shutting_down, remaining
@@ -386,8 +379,8 @@ def main():
             if not shutting_down:
                 shutting_down = True
                 # Tell the child process to fold and wait for it to exit
-                p.terminate()
-                while p.is_alive(): p.join(timeout=0.5)
+                # p.terminate()
+                # while p.is_alive(): p.join(timeout=0.5)
             else:
                 p.kill()
                 sys.exit(130)
@@ -413,18 +406,30 @@ def main():
     # number of buckets is a multiple of the number of CPU's available to
     # this process.
 
-    if args.verbose:
-        print(f"[INFO] Splitting all un-associated vectors into {concurrency} buckets")
 
-    conn = pool.getconn()
-    pk_buckets = bucket_vector_pks(conn, concurrency, args.table, args.primary_key, args.batch_size, args.verbose)
-    pool.putconn(conn)
+    # remaining / shutting_down logic:
+    # remaining = None | args.num_batches
+    # None.           ==> Keep going forever until killed.
+    #                     The signal handler will set shutting_down to True.
+    # args.num_baches ==> fetch the specified number of batches and stop.
+    #                     Start the max number of threads possible, either 'concurrency' or remaining, whichever is less.
+    #                     Once completed, subtract from remaining and continue.
+    #                     When remaining == 0, set shutting_down to True.
 
-    while True:
-        if remaining is not None and remaining <= 0:
+    while not shutting_down:
+        if remaining is not None and remaining < 1:
             if args.verbose:
                 print(f"[INFO] Reached requested iterations: {args.num_batches}")
+            shutting_down = True
             break
+
+
+        if args.verbose:
+            print(f"[INFO] Splitting all un-associated vectors into {concurrency} buckets")
+
+        conn = pool.getconn()
+        pk_buckets = bucket_vector_pks(conn, concurrency, args.table, args.primary_key, args.batch_size, args.verbose)
+        pool.putconn(conn)
 
         for bucket in pk_buckets:
             conn = pool.getconn()
@@ -436,21 +441,23 @@ def main():
                 bucket,
                 batch_size=args.batch_size,
                 verbose=args.verbose,
-                dry_run=args.dry_run,
                 k=args.clusters
             )
             pool.putconn(conn)
             
             if not success:
-                remaining = 0
+                shutting_down = True
                 break
-
 
         if remaining is not None:
             remaining -= 1
 
 
-    p.join()
+    # At this point, we're not feeding any new vectors to the gRPC server.
+    # Send a termination to the child process and wait for it exit.
+    p.terminate()
+    while p.is_alive(): p.join(timeout=0.5)
+    # p.join()
     # TODO: The above line waits for the child process running worker_cluster_assigner() to exit.
     #       If any logic around the child exit code is required, un-comment below and implement.
     # p.exitcode
