@@ -6,6 +6,7 @@ import os
 import sys
 import numpy as np
 import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import signal
 import time, random
 from psycopg2 import errors
@@ -142,7 +143,6 @@ def bucket_vector_pks(conn, concurrency, table, pk, watermark, batch_size, verbo
 
         buckets = cur.fetchall()
 
-    # print(json.dumps(rows, indent=2))
     return buckets
 
 
@@ -277,17 +277,19 @@ def persist_batch(conn, table, column, pks, labels, centroids, verbose=False):
 
 
 def run_kmeans_iteration(
-                conn,
+                pool,
                 table, pk, column,
                 bucket,
                 batch_size, verbose, k
             ):
     """One full KMeans iteration: fetch → partial_fit → predict → save epoch + assignments."""
-    
+
+    conn = pool.getconn()
     rows = fetch_vectors (
                 conn, table, pk, column, bucket[1], bucket[2],
                 batch_size=batch_size, verbose=verbose
             )
+    pool.putconn(conn)
 
     if len(rows) == 0:
         if verbose:
@@ -451,6 +453,7 @@ def main():
     #                     When remaining == 0, set shutting_down to True.
 
     bucketing_watermark = None
+    executor = ThreadPoolExecutor()
 
     while not shutting_down:
         if remaining is not None and remaining < 1:
@@ -470,30 +473,53 @@ def main():
             )
         pool.putconn(conn)
 
+        futures = []
         bucket_maxes = []
         for bucket in pk_buckets:
-            conn = pool.getconn()
+            futures.append(executor.submit(
+                run_kmeans_iteration,
+                pool,
+                args.table,
+                args.primary_key,
+                args.input,
+                bucket,
+                batch_size=args.batch_size,
+                verbose=args.verbose,
+                k=args.clusters
+            ))
 
-            try:
-                success = run_kmeans_iteration(
-                    conn,
-                    args.table,
-                    args.primary_key,
-                    args.input,
-                    bucket,
-                    batch_size=args.batch_size,
-                    verbose=args.verbose,
-                    k=args.clusters
-                )
-            except grpc.RpcError as e:
+        for future in as_completed(futures):
+            if future.exception():
                 shutting_down = True
+            else:
+                pk_max = future.result()
+                if pk_max is not None:
+                    bucket_maxes.append(pk_max)
+                    if args.verbose:
+                        print(f"[INFO] {bucket_maxes}")
 
-            pool.putconn(conn)
-            if shutting_down:
-                break
+            # TODO: Start a new thread
+            # try:
+            #     success = run_kmeans_iteration(
+            #         pool,
+            #         args.table,
+            #         args.primary_key,
+            #         args.input,
+            #         bucket,
+            #         batch_size=args.batch_size,
+            #         verbose=args.verbose,
+            #         k=args.clusters
+            #     )
+            # except grpc.RpcError as e:
+            #     shutting_down = True
 
-            if success is not None:
-                bucket_maxes.append(success)
+            # if success is not None:
+            #     bucket_maxes.append(success)
+            # TODO: End the thread here
+
+
+        if shutting_down:
+            break
 
         if remaining is not None:
             remaining -= 1
